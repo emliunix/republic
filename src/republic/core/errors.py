@@ -19,7 +19,7 @@ class ErrorKind(StrEnum):
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True)
+@dataclass
 class RepublicError(Exception):
     """Public error type for Republic."""
 

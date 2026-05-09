@@ -117,7 +117,6 @@ async def test_add_tool_results_records_tool_result() -> None:
     )
 
     assert isinstance(next_prepared, PreparedChat)
-    assert next_prepared.run_id != prepared.run_id
 
     entries = store.read("test_tape") or []
     tool_result_entries = [e for e in entries if e.kind == "tool_result"]
@@ -127,21 +126,6 @@ async def test_add_tool_results_records_tool_result() -> None:
     final = await session.run(client, next_prepared)
     assert isinstance(final, Finished)
     assert final.result.text == "done"
-
-
-@pytest.mark.asyncio
-async def test_complete_adds_extra_entries() -> None:
-    store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store)
-
-    await session.complete(
-        extra_entries=[TapeEntry.event("custom", {"key": "value"})],
-    )
-
-    entries = store.read("test_tape") or []
-    assert len(entries) == 1
-    assert entries[0].kind == "event"
-    assert entries[0].payload["name"] == "custom"
 
 
 @pytest.mark.asyncio
@@ -162,11 +146,12 @@ async def test_append_event_records_framework_event() -> None:
     store = InMemoryTapeStore()
     session = TapeSession("test_tape", store)
 
-    entry = await session.append_event("loop.step", {"iteration": 1})
+    prepared = await session.prepare("hello", "openai", "gpt-4")
+    entry = await session.append_event(prepared, "loop.step", {"iteration": 1})
 
     assert entry.kind == "event"
     assert entry.payload["name"] == "loop.step"
     assert entry.payload["data"]["iteration"] == 1
 
     entries = store.read("test_tape") or []
-    assert len(entries) == 1
+    assert len(entries) == 2

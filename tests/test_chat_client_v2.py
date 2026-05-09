@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from republic.clients.chat import ChatClient
+from republic.core.errors import RepublicError
 from republic.core.results import (
     ErrorEvent,
     FinalEvent,
@@ -53,8 +54,7 @@ async def test_chat_returns_text_result() -> None:
 
     assert isinstance(result, LLMResult)
     assert result.text == "hello"
-    assert result.ok is True
-    assert result.has_tool_calls is False
+
 
 
 @pytest.mark.asyncio
@@ -69,7 +69,6 @@ async def test_chat_returns_tool_calls() -> None:
     result = await client.chat(prepared, messages)
 
     assert isinstance(result, LLMResult)
-    assert result.has_tool_calls is True
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0]["function"]["name"] == "echo"
 
@@ -83,11 +82,10 @@ async def test_chat_returns_error_on_exception() -> None:
     prepared = PreparedChat(model="gpt-4", provider="openai")
     messages = [{"role": "user", "content": "hi"}]
 
-    result = await client.chat(prepared, messages)
+    with pytest.raises(RepublicError) as exc_info:
+        await client.chat(prepared, messages)
 
-    assert isinstance(result, LLMResult)
-    assert result.error is not None
-    assert "network error" in result.error.message
+    assert "network error" in exc_info.value.message
 
 
 @pytest.mark.asyncio

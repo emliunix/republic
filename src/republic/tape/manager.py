@@ -11,7 +11,6 @@ from republic.core.results import RepublicError
 from republic.tape.context import TapeContext, build_messages
 from republic.tape.entries import TapeEntry
 from republic.tape.query import TapeQuery
-from republic.tape.session import TapeSession
 from republic.tape.store import (
     AsyncTapeStore,
     InMemoryTapeStore,
@@ -80,6 +79,7 @@ class AsyncTapeManager:
         self, tape_name: str,
         context: TapeContext | None = None,
     ) -> AsyncIterator[TapeSession]:
+        from republic.tape.session import TapeSession
         try:
             yield TapeSession(tape_name, self._tape_store, context or self.default_context)
         finally:

@@ -11,7 +11,7 @@ from republic.tape.context import LAST_ANCHOR, TapeContext
 from republic.tape.entries import TapeEntry
 from republic.tape.manager import AsyncTapeManager
 from republic.tape.query import TapeQuery
-from republic.tape.store import AsyncTapeStoreAdapter, InMemoryTapeStore
+from republic.tape.store import InMemoryTapeStore
 
 
 def _seed_entries() -> list[TapeEntry]:
@@ -62,12 +62,12 @@ async def test_async_manager_awaits_context_selector_after_anchor_slice() -> Non
     sync_store = InMemoryTapeStore()
     for entry in _seed_entries():
         await sync_store.append("test_tape", entry)
-    manager = AsyncTapeManager(store=AsyncTapeStoreAdapter(sync_store))
+    manager = AsyncTapeManager(store=sync_store)
 
     seen: dict[str, object] = {}
 
     async def select(entries, context):
-        entry_list = list(await entries)
+        entry_list = list(entries)
         seen["contents"] = [entry.payload["content"] for entry in entry_list]
         seen["state"] = dict(context.state)
         return [{"role": "system", "content": f"{context.state['prefix']}:{entry_list[0].payload['content']}"}]

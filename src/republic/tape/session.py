@@ -43,7 +43,6 @@ class TapeSession:
     - append_entry() takes effect immediately
     - stream() is atomic w.r.t tape in that the accumulated entries will writes in batch on success or a error entry on error
     """
-    _entries: list[TapeEntry]
     _run_entry: TapeEntry | None
 
     def __init__(
@@ -92,8 +91,8 @@ class TapeSession:
         meta = {"run_id": run_id}
 
         if system_prompt:
-            self._entries.append(TapeEntry.system(system_prompt, **meta))
-        self._entries.append(TapeEntry.message({"role": "user", "content": prompt}, **meta))
+            await self._append_entry(TapeEntry.system(system_prompt, **meta))
+        await self._append_entry(TapeEntry.message({"role": "user", "content": prompt}, **meta))
 
         return PreparedChat(
             tools=get_tool_schemas(tools),
