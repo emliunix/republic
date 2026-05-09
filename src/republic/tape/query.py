@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date as date_type
-from typing import Generic, Self, TypeVar, overload
-
-from republic.tape.entries import TapeEntry
-from republic.tape.store import AsyncTapeStore, TapeStore
-
-T = TypeVar("T", bound="TapeStore | AsyncTapeStore", covariant=True)
+from typing import Self
 
 
 @dataclass(frozen=True)
-class TapeQuery(Generic[T]):
+class TapeQuery:
     tape: str
-    store: T
     _query: str | None = None
     _after_anchor: str | None = None
     _after_last: bool = False
@@ -49,12 +42,3 @@ class TapeQuery(Generic[T]):
 
     def limit(self, value: int) -> Self:
         return replace(self, _limit=value)
-
-    @overload
-    def all(self: TapeQuery[TapeStore]) -> Iterable[TapeEntry]: ...
-
-    @overload
-    async def all(self: TapeQuery[AsyncTapeStore]) -> Iterable[TapeEntry]: ...
-
-    def all(self) -> Iterable[TapeEntry] | Coroutine[None, None, Iterable[TapeEntry]]:
-        return self.store.fetch_all(self)

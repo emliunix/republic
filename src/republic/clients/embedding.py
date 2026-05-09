@@ -19,22 +19,6 @@ class EmbeddingClient:
         model_id = model or self._core.model
         return self._core.resolve_model_provider(model_id, provider)
 
-    def embed(
-        self,
-        inputs: str | list[str],
-        *,
-        model: str | None = None,
-        provider: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        provider_name, model_id = self._resolve_provider_model(model, provider)
-        client = self._core.get_client(provider_name)
-        try:
-            response = client._embedding(model=model_id, inputs=inputs, **kwargs)
-        except Exception as exc:
-            self._core.raise_wrapped(exc, provider_name, model_id)
-        return response
-
     async def embed_async(
         self,
         inputs: str | list[str],

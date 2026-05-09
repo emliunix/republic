@@ -1,10 +1,22 @@
-"""Chat helpers for Republic."""
+"""Chat helpers for Republic.
+
+This module provides ChatClient, which is a consumer of LLMCore's retry
+contract. ChatClient does not implement retry itself; it participates in
+LLMCore's retry waterfall by providing on_response CPS callbacks.
+
+Key architectural contract:
+  - Non-streaming: on_response parses the response INSIDE the retry loop.
+    Parse errors (empty response) raise TEMPORARY, triggering LLMCore retry.
+  - Streaming: on_response validates the response is a stream, then returns
+    it raw. The async generator escapes the retry loop and is consumed by
+    the caller. Parse errors during streaming become ErrorEvent (no retry).
+"""
 
 from __future__ import annotations
 
-import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from copy import error
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
@@ -15,35 +27,20 @@ from republic.core.errors import ErrorKind, RepublicError
 from republic.core.execution import LLMCore, TransportResponse
 from republic.core.results import (
     AsyncStreamEvents,
-    AsyncTextStream,
+    ErrorEvent,
+    FinalEvent,
+    LLMResult,
+    PreparedChat,
     StreamEvent,
-    StreamEvents,
-    StreamState,
-    TextStream,
-    ToolAutoResult,
+    TextEvent,
 )
-from republic.tape.context import TapeContext
-from republic.tape.manager import AsyncTapeManager, TapeManager
-from republic.tools.context import ToolContext
-from republic.tools.executor import ToolExecutor
-from republic.tools.schema import ToolInput, ToolSet, normalize_tools
 
-MessageInput = dict[str, Any]
 RESPONSES_METADATA_ONLY_ITEM_TYPES = frozenset({"reasoning", "compaction"})
 
 
-@dataclass(frozen=True)
-class PreparedChat:
-    payload: list[dict[str, Any]]
-    new_messages: list[dict[str, Any]]
-    toolset: ToolSet
-    tape: str | None
-    should_update: bool
-    context_error: RepublicError | None
-    run_id: str
-    system_prompt: str | None
-    context: TapeContext | None
-
+# =============================================================================
+# TOOL CALL ASSEMBLER
+# =============================================================================
 
 class ToolCallAssembler:
     def __init__(self) -> None:
@@ -134,20 +131,13 @@ class ToolCallAssembler:
         if index is not None:
             return self._resolve_key_by_index(tool_call, index, position)
 
-        # Some providers omit id/index for follow-up tool-call deltas.
-        # Merge by positional order so argument fragments are not split into fake calls.
         position_key = self._key_at_position(position)
         if position_key is not None:
             return position_key
         return ("position", position)
 
     @staticmethod
-    def _merge_arguments(
-        entry: dict[str, Any],
-        *,
-        arguments: Any,
-        arguments_complete: bool,
-    ) -> None:
+    def _merge_arguments(entry: dict[str, Any], *, arguments: Any, arguments_complete: bool) -> None:
         if arguments is None:
             return
         if not isinstance(arguments, str):
@@ -182,1908 +172,310 @@ class ToolCallAssembler:
             if name:
                 entry["function"]["name"] = name
             arguments = _field(func, "arguments")
-            self._merge_arguments(
-                entry,
-                arguments=arguments,
-                arguments_complete=bool(_field(tool_call, "arguments_complete", False)),
-            )
+            self._merge_arguments(entry, arguments=arguments, arguments_complete=bool(_field(tool_call, "arguments_complete", False)))
 
     def finalize(self) -> list[dict[str, Any]]:
         return expand_tool_calls([self._calls[key] for key in self._order])
 
 
+# =============================================================================
+# PARSE ACCUMULATOR (unchanged)
+# =============================================================================
+
+@dataclass
+class _ParseAccumulator:
+    text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    assembler: ToolCallAssembler = field(default_factory=ToolCallAssembler)
+    usage: dict[str, Any] | None = None
+    output_item_types: set[str] = field(default_factory=set)
+
+    def to_result(self, request: PreparedChat) -> LLMResult:
+        metadata_only = (
+            len(self.output_item_types) > 0
+            and self.output_item_types.issubset(RESPONSES_METADATA_ONLY_ITEM_TYPES)
+        )
+        return LLMResult(
+            request=request,
+            text="".join(self.text_parts) if self.text_parts else None,
+            tool_calls=self.assembler.finalize(),
+            reasoning="".join(self.reasoning_parts) if self.reasoning_parts else None,
+            usage=self.usage,
+            metadata_only=metadata_only,
+        )
+
+
+# =============================================================================
+# PARSING HELPERS (unchanged)
+# =============================================================================
+
+def _unwrap_response(response: Any) -> tuple[Any, TransportKind | None]:
+    if isinstance(response, TransportResponse):
+        return response.payload, response.transport
+    return response, None
+
+
+def _resolve_transport(payload: Any, transport: TransportKind | None = None) -> TransportKind:
+    if transport is not None:
+        return transport
+    if isinstance(payload, list):
+        return "responses"
+    if _field(payload, "output") is not None:
+        return "responses"
+    if _field(payload, "output_text") is not None:
+        return "responses"
+    event_type = _field(payload, "type")
+    if isinstance(event_type, str) and event_type.startswith("response."):
+        return "responses"
+    return "completion"
+
+
+def _parser_for_payload(payload: Any, *, transport: TransportKind | None = None) -> BaseTransportParser:
+    effective_transport = _resolve_transport(payload, transport)
+    return parser_for_transport(effective_transport)
+
+
+def _unwrap_response_with_parser(response: Any, *, transport: TransportKind | None = None) -> tuple[Any, BaseTransportParser]:
+    payload, detected_transport = _unwrap_response(response)
+    parser = _parser_for_payload(payload, transport=transport or detected_transport)
+    return payload, parser
+
+
+def _is_completed_responses_metadata_only(response: Any, *, transport: TransportKind | None = None) -> bool:
+    payload, detected_transport = _unwrap_response(response)
+    effective_transport = _resolve_transport(payload, transport or detected_transport)
+    if effective_transport != "responses":
+        return False
+    if _field(payload, "status") != "completed":
+        return False
+    if _field(payload, "incomplete_details") is not None:
+        return False
+
+    output = _field(payload, "output")
+    if not isinstance(output, list) or not output:
+        return False
+    return all(
+        isinstance(item_type := _field(item, "type"), str) and item_type in RESPONSES_METADATA_ONLY_ITEM_TYPES
+        for item in output
+    )
+
+
+def _is_non_stream_response(response: Any, *, transport: TransportKind | None = None) -> bool:
+    parser = _parser_for_payload(response, transport=transport)
+    return parser.is_non_stream_response(response)
+
+
+def _responses_output_item_type(chunk: Any, *, transport: TransportKind | None = None) -> str | None:
+    effective_transport = _resolve_transport(chunk, transport)
+    if effective_transport != "responses":
+        return None
+    if _field(chunk, "type") not in {"response.output_item.added", "response.output_item.done"}:
+        return None
+    item_type = _field(_field(chunk, "item"), "type")
+    return item_type if isinstance(item_type, str) else None
+
+
+def _extract_text(response: Any, *, transport: TransportKind | None = None) -> tuple[str, str | None]:
+    payload, parser = _unwrap_response_with_parser(response, transport=transport)
+    return parser.extract_text(payload)
+
+
+def _extract_tool_calls(response: Any, *, transport: TransportKind | None = None) -> list[dict[str, Any]]:
+    payload, parser = _unwrap_response_with_parser(response, transport=transport)
+    return parser.extract_tool_calls(payload)
+
+
+def _extract_usage(response: Any, *, transport: TransportKind | None = None) -> dict[str, Any] | None:
+    payload, parser = _unwrap_response_with_parser(response, transport=transport)
+    return parser.extract_usage(payload)
+
+
+def _extract_chunk_tool_call_deltas(chunk: Any, *, transport: TransportKind | None = None) -> list[Any]:
+    parser = _parser_for_payload(chunk, transport=transport)
+    return parser.extract_chunk_tool_call_deltas(chunk)
+
+
+def _extract_chunk_text(chunk: Any, *, transport: TransportKind | None = None) -> tuple[str | None, str | None]:
+    parser = _parser_for_payload(chunk, transport=transport)
+    return parser.extract_chunk_text(chunk)
+
+
+# =============================================================================
+# CPS CALLBACKS (top-level functions, bound via partial)
+# =============================================================================
+
+def _chat_on_response(
+    prepared: PreparedChat,
+    response: Any,
+    provider: str,
+    model: str,
+    attempt: int,
+) -> LLMResult:
+    """CPS callback for non-streaming calls.
+
+    Passed to LLMCore.run_chat_async as on_response. Executes inside the
+    retry loop, so parse errors can trigger retry by raising TEMPORARY.
+
+    Use: on_response = partial(_chat_on_response, prepared)
+    """
+    payload, transport = _unwrap_response(response)
+    text, reasoning = _extract_text(payload, transport=transport)
+    tool_calls = _extract_tool_calls(payload, transport=transport)
+    usage = _extract_usage(payload, transport=transport)
+
+    prepared = replace(prepared, provider=provider, model=model)
+
+    if not text and not tool_calls:
+        if _is_completed_responses_metadata_only(payload, transport=transport):
+            return LLMResult(
+                request=prepared,
+                text=text,
+                reasoning=reasoning,
+                usage=usage,
+                metadata_only=True,
+            )
+        # Parse-time retry: empty response triggers TEMPORARY
+        raise RepublicError(
+            ErrorKind.TEMPORARY,
+            f"{provider}:{model}: empty response (attempt {attempt})",
+        )
+
+    return LLMResult(
+        request=prepared,
+        text=text,
+        reasoning=reasoning,
+        tool_calls=tool_calls,
+        usage=usage,
+    )
+
+
+def _error_iter(error: RepublicError) -> AsyncStreamEvents[LLMResult]:
+    async def _error_iter():
+        yield ErrorEvent(error)
+    return AsyncStreamEvents(_error_iter())
+
+
+# =============================================================================
+# CHAT CLIENT
+# =============================================================================
+
 class ChatClient:
-    """Chat operations with structured outputs."""
+    """Pure transport parsing. No tool execution, no tape writes.
 
-    def __init__(
-        self,
-        core: LLMCore,
-        tool_executor: ToolExecutor,
-        tape: TapeManager,
-        async_tape: AsyncTapeManager,
-    ) -> None:
+    ChatClient is a consumer of LLMCore's retry contract. It does not
+    implement retry itself; it participates by providing on_response
+    callbacks that execute inside LLMCore's retry loop.
+
+    Non-streaming: on_response parses the response and may raise TEMPORARY
+    to trigger same-model retry (e.g., empty response).
+
+    Streaming: on_response validates the response is a stream and returns
+    it raw. The async generator escapes the retry loop and is consumed by
+    the caller. Parse errors during streaming become ErrorEvent (no retry).
+    """
+
+    def __init__(self, core: LLMCore) -> None:
         self._core = core
-        self._tool_executor = tool_executor
-        self._tape = tape
-        self._async_tape = async_tape
 
-    @property
-    def default_context(self) -> TapeContext:
-        return self._tape.default_context
+    async def chat(self, prepared: PreparedChat, messages: list[dict[str, Any]]) -> LLMResult:
+        """Execute a non-streaming LLM call with retry support.
 
-    @staticmethod
-    def _unwrap_response(response: Any) -> tuple[Any, TransportKind | None]:
-        if isinstance(response, TransportResponse):
-            return response.payload, response.transport
-        return response, None
+        The on_response callback parses the response inside LLMCore's retry
+        loop, so parse errors (e.g., empty response) trigger retry.
+        """
 
-    @staticmethod
-    def _resolve_transport(
-        payload: Any,
-        transport: TransportKind | None = None,
-    ) -> TransportKind:
-        if transport is not None:
-            return transport
-        if isinstance(payload, list):
-            return "responses"
-        if _field(payload, "output") is not None:
-            return "responses"
-        if _field(payload, "output_text") is not None:
-            return "responses"
-        event_type = _field(payload, "type")
-        if isinstance(event_type, str) and event_type.startswith("response."):
-            return "responses"
-        return "completion"
-
-    @staticmethod
-    def _parser_for_payload(
-        payload: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> BaseTransportParser:
-        effective_transport = ChatClient._resolve_transport(payload, transport)
-        return parser_for_transport(effective_transport)
-
-    @staticmethod
-    def _unwrap_response_with_parser(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> tuple[Any, BaseTransportParser]:
-        payload, detected_transport = ChatClient._unwrap_response(response)
-        parser = ChatClient._parser_for_payload(payload, transport=transport or detected_transport)
-        return payload, parser
-
-    @staticmethod
-    def _is_completed_responses_metadata_only(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> bool:
-        payload, detected_transport = ChatClient._unwrap_response(response)
-        effective_transport = ChatClient._resolve_transport(payload, transport or detected_transport)
-        if effective_transport != "responses":
-            return False
-        if _field(payload, "status") != "completed":
-            return False
-        if _field(payload, "incomplete_details") is not None:
-            return False
-
-        output = _field(payload, "output")
-        if not isinstance(output, list) or not output:
-            return False
-        return all(
-            isinstance(item_type := _field(item, "type"), str) and item_type in RESPONSES_METADATA_ONLY_ITEM_TYPES
-            for item in output
-        )
-
-    @staticmethod
-    def _is_non_stream_response(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> bool:
-        parser = ChatClient._parser_for_payload(response, transport=transport)
-        return parser.is_non_stream_response(response)
-
-    @staticmethod
-    def _responses_output_item_type(
-        chunk: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> str | None:
-        effective_transport = ChatClient._resolve_transport(chunk, transport)
-        if effective_transport != "responses":
-            return None
-        if _field(chunk, "type") not in {"response.output_item.added", "response.output_item.done"}:
-            return None
-        item_type = _field(_field(chunk, "item"), "type")
-        return item_type if isinstance(item_type, str) else None
-
-    @staticmethod
-    def _is_completed_responses_stream_metadata_only(
-        *,
-        completed: bool,
-        output_item_types: set[str],
-    ) -> bool:
-        if not completed or not output_item_types:
-            return False
-        return output_item_types.issubset(RESPONSES_METADATA_ONLY_ITEM_TYPES)
-
-    def _validate_chat_input(
-        self,
-        *,
-        prompt: str | None,
-        messages: list[MessageInput] | None,
-        system_prompt: str | None,
-        tape: str | None,
-    ) -> None:
-        if prompt is not None and messages is not None:
-            raise RepublicError(ErrorKind.INVALID_INPUT, "Provide either prompt or messages, not both.")
-        if prompt is None and messages is None:
-            raise RepublicError(ErrorKind.INVALID_INPUT, "Either prompt or messages is required.")
-        if messages is not None and (system_prompt is not None or tape is not None):
-            raise RepublicError(
-                ErrorKind.INVALID_INPUT,
-                "system_prompt and tape are not supported with messages input.",
-            )
-
-    def _prepare_messages(
-        self,
-        prompt: str | None,
-        system_prompt: str | None,
-        tape: str | None,
-        messages: list[MessageInput] | None,
-        context: TapeContext | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        self._validate_chat_input(
-            prompt=prompt,
-            messages=messages,
-            system_prompt=system_prompt,
-            tape=tape,
-        )
-
-        if messages is not None:
-            payload = [dict(message) for message in messages]
-            return payload, []
-
-        if prompt is None:
-            raise RepublicError(ErrorKind.INVALID_INPUT, "prompt is required when messages is not provided")
-
-        user_message = {"role": "user", "content": prompt}
-
-        if tape is None:
-            payload: list[dict[str, Any]] = []
-            if system_prompt:
-                payload.append({"role": "system", "content": system_prompt})
-            payload.append(user_message)
-            return payload, []
-
-        history = self._tape.read_messages(tape, context=context)
-        payload = []
-        if system_prompt:
-            payload.append({"role": "system", "content": system_prompt})
-        payload.extend(history)
-        payload.append(user_message)
-        return payload, [user_message]
-
-    async def _prepare_messages_async(
-        self,
-        prompt: str | None,
-        system_prompt: str | None,
-        tape: str | None,
-        messages: list[MessageInput] | None,
-        context: TapeContext | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        self._validate_chat_input(
-            prompt=prompt,
-            messages=messages,
-            system_prompt=system_prompt,
-            tape=tape,
-        )
-
-        if messages is not None:
-            payload = [dict(message) for message in messages]
-            return payload, []
-
-        if prompt is None:
-            raise RepublicError(ErrorKind.INVALID_INPUT, "prompt is required when messages is not provided")
-
-        user_message = {"role": "user", "content": prompt}
-
-        if tape is None:
-            payload: list[dict[str, Any]] = []
-            if system_prompt:
-                payload.append({"role": "system", "content": system_prompt})
-            payload.append(user_message)
-            return payload, []
-
-        history = await self._async_tape.read_messages(tape, context=context)
-        payload = []
-        if system_prompt:
-            payload.append({"role": "system", "content": system_prompt})
-        payload.extend(history)
-        payload.append(user_message)
-        return payload, [user_message]
-
-    def _prepare_request(
-        self,
-        *,
-        prompt: str | None,
-        system_prompt: str | None,
-        messages: list[MessageInput] | None,
-        tape: str | None,
-        context: TapeContext | None,
-        tools: ToolInput,
-        require_tools: bool = False,
-        require_runnable: bool = False,
-    ) -> PreparedChat:
-        context_error: RepublicError | None = None
-        payload: list[dict[str, Any]] = []
-        new_messages: list[dict[str, Any]] = []
-        try:
-            payload, new_messages = self._prepare_messages(
-                prompt,
-                system_prompt,
-                tape,
-                messages,
-                context=context,
-            )
-            if require_tools and not tools:
-                raise RepublicError(ErrorKind.INVALID_INPUT, "tools are required for this operation.")  # noqa: TRY301
-            toolset = self._normalize_tools(tools)
-        except RepublicError as exc:
-            context_error = exc
-            toolset = ToolSet([], [])
-        else:
-            if require_runnable:
-                try:
-                    toolset.require_runnable()
-                except ValueError as exc:
-                    context_error = RepublicError(ErrorKind.INVALID_INPUT, str(exc))
-
-        should_update = tape is not None and messages is None
-        run_id = uuid.uuid4().hex
-        return PreparedChat(
-            payload=payload,
-            new_messages=new_messages,
-            toolset=toolset,
-            tape=tape,
-            should_update=should_update,
-            context_error=context_error,
-            run_id=run_id,
-            system_prompt=system_prompt,
-            context=context,
-        )
-
-    async def _prepare_request_async(
-        self,
-        *,
-        prompt: str | None,
-        system_prompt: str | None,
-        messages: list[MessageInput] | None,
-        tape: str | None,
-        context: TapeContext | None,
-        tools: ToolInput,
-        require_tools: bool = False,
-        require_runnable: bool = False,
-    ) -> PreparedChat:
-        context_error: RepublicError | None = None
-        payload: list[dict[str, Any]] = []
-        new_messages: list[dict[str, Any]] = []
-        try:
-            payload, new_messages = await self._prepare_messages_async(
-                prompt,
-                system_prompt,
-                tape,
-                messages,
-                context=context,
-            )
-            if require_tools and not tools:
-                raise RepublicError(ErrorKind.INVALID_INPUT, "tools are required for this operation.")  # noqa: TRY301
-            toolset = self._normalize_tools(tools)
-        except RepublicError as exc:
-            context_error = exc
-            toolset = ToolSet([], [])
-        else:
-            if require_runnable:
-                try:
-                    toolset.require_runnable()
-                except ValueError as exc:
-                    context_error = RepublicError(ErrorKind.INVALID_INPUT, str(exc))
-
-        should_update = tape is not None and messages is None
-        run_id = uuid.uuid4().hex
-        return PreparedChat(
-            payload=payload,
-            new_messages=new_messages,
-            toolset=toolset,
-            tape=tape,
-            should_update=should_update,
-            context_error=context_error,
-            run_id=run_id,
-            system_prompt=system_prompt,
-            context=context,
-        )
-
-    @staticmethod
-    def _split_reasoning_effort(kwargs: dict[str, Any]) -> tuple[Any | None, dict[str, Any]]:
-        if "reasoning_effort" not in kwargs:
-            return None, kwargs
-        request_kwargs = dict(kwargs)
-        reasoning_effort = request_kwargs.pop("reasoning_effort", None)
-        return reasoning_effort, request_kwargs
-
-    def _execute_sync(
-        self,
-        prepared: PreparedChat,
-        *,
-        tools_payload: list[dict[str, Any]] | None,
-        model: str | None,
-        provider: str | None,
-        max_tokens: int | None,
-        stream: bool,
-        kwargs: dict[str, Any],
-        on_response: Callable[[Any, str, str, int], Any],
-    ) -> Any:
-        if prepared.context_error is not None:
-            raise prepared.context_error
-        reasoning_effort, request_kwargs = self._split_reasoning_effort(kwargs)
-        try:
-            return self._core.run_chat_sync(
-                messages_payload=prepared.payload,
-                tools_payload=tools_payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=stream,
-                reasoning_effort=reasoning_effort,
-                kwargs=request_kwargs,
-                on_response=on_response,
-            )
-        except RepublicError as exc:
-            raise RepublicError(exc.kind, exc.message) from exc
-
-    async def _execute_async(
-        self,
-        prepared: PreparedChat,
-        *,
-        tools_payload: list[dict[str, Any]] | None,
-        model: str | None,
-        provider: str | None,
-        max_tokens: int | None,
-        stream: bool,
-        kwargs: dict[str, Any],
-        on_response: Callable[[Any, str, str, int], Any],
-    ) -> Any:
-        if prepared.context_error is not None:
-            raise prepared.context_error
-        reasoning_effort, request_kwargs = self._split_reasoning_effort(kwargs)
         try:
             return await self._core.run_chat_async(
-                messages_payload=prepared.payload,
-                tools_payload=tools_payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=stream,
-                reasoning_effort=reasoning_effort,
-                kwargs=request_kwargs,
-                on_response=on_response,
+                messages_payload=messages,
+                stream=False,
+                **prepared.core_kwargs,
+                on_response=partial(_chat_on_response, prepared),
             )
         except RepublicError as exc:
-            raise RepublicError(exc.kind, exc.message) from exc
+            raise exc
+        except Exception as exc:
+            error = self._core.wrap_error(exc, prepared.provider or "", prepared.model or "")
+            raise error
 
-    def _normalize_tools(self, tools: ToolInput) -> ToolSet:
+    async def stream(
+        self,
+        prepared: PreparedChat,
+        messages: list[dict[str, Any]],
+    ) -> AsyncStreamEvents[LLMResult]:
+        """Execute a streaming LLM call.
+
+        The on_response callback validates the response is a stream (inside
+        the retry loop), then returns it raw. The async generator is consumed
+        outside the retry loop by the caller. Parse errors during streaming
+        become ErrorEvent (no retry possible — stream already in progress).
+
+        Returns immediately to preserve real-time streaming nature.
+        """
+
         try:
-            return normalize_tools(tools)
-        except (ValueError, TypeError) as exc:
-            raise RepublicError(ErrorKind.INVALID_INPUT, str(exc)) from exc
-
-    def _update_tape(
-        self,
-        prepared: PreparedChat,
-        response_text: str | None,
-        *,
-        tool_calls: list[dict[str, Any]] | None = None,
-        tool_results: list[Any] | None = None,
-        error: RepublicError | None = None,
-        response: Any | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        usage: dict[str, Any] | None = None,
-    ) -> None:
-        if not prepared.should_update:
-            return
-        if prepared.tape is None:
-            return
-        self._tape.record_chat(
-            tape=prepared.tape,
-            run_id=prepared.run_id,
-            system_prompt=prepared.system_prompt,
-            context_error=prepared.context_error,
-            new_messages=prepared.new_messages,
-            response_text=response_text,
-            tool_calls=tool_calls,
-            tool_results=tool_results,
-            error=error,
-            response=response,
-            provider=provider,
-            model=model,
-            usage=usage,
-        )
-
-    async def _update_tape_async(
-        self,
-        prepared: PreparedChat,
-        response_text: str | None,
-        *,
-        tool_calls: list[dict[str, Any]] | None = None,
-        tool_results: list[Any] | None = None,
-        error: RepublicError | None = None,
-        response: Any | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        usage: dict[str, Any] | None = None,
-    ) -> None:
-        if not prepared.should_update:
-            return
-        if prepared.tape is None:
-            return
-        await self._async_tape.record_chat(
-            tape=prepared.tape,
-            run_id=prepared.run_id,
-            system_prompt=prepared.system_prompt,
-            context_error=prepared.context_error,
-            new_messages=prepared.new_messages,
-            response_text=response_text,
-            tool_calls=tool_calls,
-            tool_results=tool_results,
-            error=error,
-            response=response,
-            provider=provider,
-            model=model,
-            usage=usage,
-        )
-
-    @staticmethod
-    def _empty_iterator() -> Iterator[str]:
-        return iter(())
-
-    @staticmethod
-    async def _empty_async_iterator() -> AsyncIterator[str]:
-        if False:
-            yield ""
-
-    def _stream_error_result(self, prepared: PreparedChat, error: RepublicError) -> TextStream:
-        self._update_tape(prepared, None, error=error)
-        return TextStream(self._empty_iterator(), state=StreamState(error=error))
-
-    async def _stream_async_error_result(self, prepared: PreparedChat, error: RepublicError) -> AsyncTextStream:
-        await self._update_tape_async(prepared, None, error=error)
-        return AsyncTextStream(self._empty_async_iterator(), state=StreamState(error=error))
-
-    def _event_error_result(self, prepared: PreparedChat, error: RepublicError) -> StreamEvents:
-        self._update_tape(prepared, None, error=error)
-        state = StreamState(error=error)
-        events = [
-            StreamEvent("error", error.as_dict()),
-            StreamEvent(
-                "final",
-                self._final_event_data(
-                    text=None,
-                    tool_calls=[],
-                    tool_results=[],
-                    usage=None,
-                    error=error,
-                ),
-            ),
-        ]
-        return StreamEvents(iter(events), state=state)
-
-    async def _event_async_error_result(self, prepared: PreparedChat, error: RepublicError) -> AsyncStreamEvents:
-        await self._update_tape_async(prepared, None, error=error)
-        state = StreamState(error=error)
-
-        async def _iterator() -> AsyncIterator[StreamEvent]:
-            yield StreamEvent("error", error.as_dict())
-            yield StreamEvent(
-                "final",
-                self._final_event_data(
-                    text=None,
-                    tool_calls=[],
-                    tool_results=[],
-                    usage=None,
-                    error=error,
-                ),
-            )
-
-        return AsyncStreamEvents(_iterator(), state=state)
-
-    @staticmethod
-    def _final_event_data(
-        *,
-        text: str | None,
-        tool_calls: list[dict[str, Any]],
-        tool_results: list[Any],
-        usage: dict[str, Any] | None,
-        error: RepublicError | None,
-    ) -> dict[str, Any]:
-        return {
-            "text": text,
-            "tool_calls": tool_calls,
-            "tool_results": tool_results,
-            "usage": usage,
-            "ok": error is None,
-        }
-
-    def _finalize_text_stream(
-        self,
-        prepared: PreparedChat,
-        *,
-        text: str | None,
-        tool_calls: list[dict[str, Any]],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-        usage: dict[str, Any] | None = None,
-        response: Any | None = None,
-        log_empty: bool = False,
-        completed_metadata_only: bool = False,
-    ) -> None:
-        if (
-            not text
-            and not tool_calls
-            and state.error is None
-            and not completed_metadata_only
-            and not self._is_completed_responses_metadata_only(response)
-        ):
-            empty_error = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-            if log_empty:
-                self._core.log_error(empty_error, provider_name, model_id, attempt)
-            state.error = RepublicError(empty_error.kind, empty_error.message)
-        state.usage = usage
-        self._update_tape(
-            prepared,
-            text or None,
-            tool_calls=tool_calls or None,
-            tool_results=None,
-            error=state.error,
-            response=response,
-            provider=provider_name,
-            model=model_id,
-            usage=usage,
-        )
-
-    async def _finalize_text_stream_async(
-        self,
-        prepared: PreparedChat,
-        *,
-        text: str | None,
-        tool_calls: list[dict[str, Any]],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-        usage: dict[str, Any] | None = None,
-        response: Any | None = None,
-        log_empty: bool = False,
-        completed_metadata_only: bool = False,
-    ) -> None:
-        if (
-            not text
-            and not tool_calls
-            and state.error is None
-            and not completed_metadata_only
-            and not self._is_completed_responses_metadata_only(response)
-        ):
-            empty_error = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-            if log_empty:
-                self._core.log_error(empty_error, provider_name, model_id, attempt)
-            state.error = RepublicError(empty_error.kind, empty_error.message)
-        state.usage = usage
-        await self._update_tape_async(
-            prepared,
-            text or None,
-            tool_calls=tool_calls or None,
-            tool_results=None,
-            error=state.error,
-            response=response,
-            provider=provider_name,
-            model=model_id,
-            usage=usage,
-        )
-
-    def _finalize_event_stream(
-        self,
-        prepared: PreparedChat,
-        *,
-        parts: list[str],
-        tool_calls: list[dict[str, Any]],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-        usage: dict[str, Any] | None,
-        completed_metadata_only: bool = False,
-    ) -> tuple[list[StreamEvent], list[Any]]:
-        events: list[StreamEvent] = []
-        for idx, call in enumerate(tool_calls):
-            events.append(StreamEvent("tool_call", {"index": idx, "call": call}))
-
-        tool_results: list[Any] = []
-        try:
-            tool_results = self._execute_tool_calls(
-                prepared,
-                tool_calls,
-                provider_name,
-                model_id,
+            return await self._core.run_chat_async(
+                messages_payload=messages,
+                stream=True,
+                **prepared.core_kwargs,
+                on_response=partial(self._stream_on_response_events, prepared),
             )
         except RepublicError as exc:
-            state.error = exc
-            events.append(StreamEvent("error", exc.as_dict()))
-        if tool_results:
-            for idx, result in enumerate(tool_results):
-                events.append(StreamEvent("tool_result", {"index": idx, "result": result}))
+            return _error_iter(exc)
+        except Exception as exc:
+            error = self._core.wrap_error(exc, prepared.provider or "", prepared.model or "")
+            return _error_iter(error)
 
-        if not parts and not tool_calls and state.error is None and not completed_metadata_only:
-            empty_error = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-            self._core.log_error(empty_error, provider_name, model_id, attempt)
-            state.error = empty_error
-            events.append(StreamEvent("error", empty_error.as_dict()))
-
-        if usage is not None:
-            events.append(StreamEvent("usage", usage))
-
-        events.append(
-            StreamEvent(
-                "final",
-                self._final_event_data(
-                    text="".join(parts) if parts else None,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                ),
-            )
-        )
-        return events, tool_results
-
-    async def _finalize_event_stream_async(
-        self,
-        prepared: PreparedChat,
-        *,
-        parts: list[str],
-        tool_calls: list[dict[str, Any]],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-        usage: dict[str, Any] | None,
-        completed_metadata_only: bool = False,
-    ) -> tuple[list[StreamEvent], list[Any]]:
-        events: list[StreamEvent] = []
-        for idx, call in enumerate(tool_calls):
-            events.append(StreamEvent("tool_call", {"index": idx, "call": call}))
-
-        tool_results: list[Any] = []
-        try:
-            tool_results = await self._execute_tool_calls_async(
-                prepared,
-                tool_calls,
-                provider_name,
-                model_id,
-            )
-        except RepublicError as exc:
-            state.error = exc
-            events.append(StreamEvent("error", exc.as_dict()))
-        if tool_results:
-            for idx, result in enumerate(tool_results):
-                events.append(StreamEvent("tool_result", {"index": idx, "result": result}))
-
-        if not parts and not tool_calls and state.error is None and not completed_metadata_only:
-            empty = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-            self._core.log_error(empty, provider_name, model_id, attempt)
-            empty_error = RepublicError(empty.kind, empty.message)
-            state.error = empty_error
-            events.append(StreamEvent("error", empty_error.as_dict()))
-
-        if usage is not None:
-            events.append(StreamEvent("usage", usage))
-
-        events.append(
-            StreamEvent(
-                "final",
-                self._final_event_data(
-                    text="".join(parts) if parts else None,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                ),
-            )
-        )
-        return events, tool_results
-
-    def _finalize_event_stream_state(
-        self,
-        prepared: PreparedChat,
-        *,
-        parts: list[str],
-        tool_calls: list[dict[str, Any]] | None,
-        tool_results: list[Any],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        usage: dict[str, Any] | None,
-        assembler: ToolCallAssembler,
-    ) -> list[dict[str, Any]]:
-        state.usage = usage
-        final_calls = tool_calls or assembler.finalize()
-        self._update_tape(
-            prepared,
-            "".join(parts) if parts else None,
-            tool_calls=final_calls or None,
-            tool_results=tool_results or None,
-            error=state.error,
-            provider=provider_name,
-            model=model_id,
-            usage=usage,
-        )
-        return final_calls
-
-    async def _finalize_event_stream_state_async(
-        self,
-        prepared: PreparedChat,
-        *,
-        parts: list[str],
-        tool_calls: list[dict[str, Any]] | None,
-        tool_results: list[Any],
-        state: StreamState,
-        provider_name: str,
-        model_id: str,
-        usage: dict[str, Any] | None,
-        assembler: ToolCallAssembler,
-    ) -> list[dict[str, Any]]:
-        state.usage = usage
-        final_calls = tool_calls or assembler.finalize()
-        await self._update_tape_async(
-            prepared,
-            "".join(parts) if parts else None,
-            tool_calls=final_calls or None,
-            tool_results=tool_results or None,
-            error=state.error,
-            provider=provider_name,
-            model=model_id,
-            usage=usage,
-        )
-        return final_calls
-
-    def _error_event_sequence(
-        self,
-        *,
-        parts: list[str],
-        tool_calls: list[dict[str, Any]],
-        tool_results: list[Any],
-        usage: dict[str, Any] | None,
-        error: RepublicError,
-    ) -> list[StreamEvent]:
-        return [
-            StreamEvent("error", error.as_dict()),
-            StreamEvent(
-                "final",
-                self._final_event_data(
-                    text="".join(parts) if parts else None,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=error,
-                ),
-            ),
-        ]
-
-    def _handle_create_response(
+    def _stream_on_response_events(
         self,
         prepared: PreparedChat,
         response: Any,
-        provider_name: str,
-        model_id: str,
+        provider: str,
+        model: str,
         attempt: int,
-    ) -> str:
-        payload, transport = self._unwrap_response(response)
-        text = self._extract_text(payload, transport=transport)
-        if text:
-            self._update_tape(
-                prepared,
-                text,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return text
-        if self._is_completed_responses_metadata_only(payload, transport=transport):
-            self._update_tape(
-                prepared,
-                None,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ""
-        raise RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
+    ) -> AsyncStreamEvents[LLMResult]:
+        payload, transport = _unwrap_response(response)
+        accumulator = _ParseAccumulator()
 
-    async def _handle_create_response_async(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> str:
-        payload, transport = self._unwrap_response(response)
-        text = self._extract_text(payload, transport=transport)
-        if text:
-            await self._update_tape_async(
-                prepared,
-                text,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return text
-        if self._is_completed_responses_metadata_only(payload, transport=transport):
-            await self._update_tape_async(
-                prepared,
-                None,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ""
-        raise RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
+        if _is_non_stream_response(payload, transport=transport):
+            return _error_iter(RepublicError(
+                ErrorKind.INVALID_INPUT,
+                f"{provider}:{model}: response is not a stream.",
+            ))
+        
+        prepared = replace(prepared, provider=provider, model=model)
 
-    def _handle_tool_calls_response(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> list[dict[str, Any]]:
-        payload, transport = self._unwrap_response(response)
-        calls = self._extract_tool_calls(payload, transport=transport)
-        self._update_tape(
-            prepared,
-            None,
-            tool_calls=calls,
-            tool_results=[],
-            response=payload,
-            provider=provider_name,
-            model=model_id,
-        )
-        return calls
-
-    async def _handle_tool_calls_response_async(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> list[dict[str, Any]]:
-        payload, transport = self._unwrap_response(response)
-        calls = self._extract_tool_calls(payload, transport=transport)
-        await self._update_tape_async(
-            prepared,
-            None,
-            tool_calls=calls,
-            tool_results=[],
-            response=payload,
-            provider=provider_name,
-            model=model_id,
-        )
-        return calls
-
-    def _handle_tools_auto_response(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> ToolAutoResult:
-        payload, transport = self._unwrap_response(response)
-        tool_calls = self._extract_tool_calls(payload, transport=transport)
-        if tool_calls:
-            execution = self._tool_executor.execute(
-                tool_calls,
-                tools=prepared.toolset.runnable,
-                context=self._make_tool_context(prepared, provider_name, model_id),
-            )
-            self._update_tape(
-                prepared,
-                None,
-                tool_calls=execution.tool_calls,
-                tool_results=execution.tool_results,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.tools_result(execution.tool_calls, execution.tool_results)
-
-        text = self._extract_text(payload, transport=transport)
-        if text:
-            self._update_tape(
-                prepared,
-                text,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.text_result(text)
-        if self._is_completed_responses_metadata_only(payload, transport=transport):
-            self._update_tape(
-                prepared,
-                None,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.text_result("")
-
-        raise RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-
-    async def _handle_tools_auto_response_async(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> ToolAutoResult:
-        payload, transport = self._unwrap_response(response)
-        tool_calls = self._extract_tool_calls(payload, transport=transport)
-        if tool_calls:
-            execution = await self._tool_executor.execute_async(
-                tool_calls,
-                tools=prepared.toolset.runnable,
-                context=self._make_tool_context(prepared, provider_name, model_id),
-            )
-            await self._update_tape_async(
-                prepared,
-                None,
-                tool_calls=execution.tool_calls,
-                tool_results=execution.tool_results,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.tools_result(execution.tool_calls, execution.tool_results)
-
-        text = self._extract_text(payload, transport=transport)
-        if text:
-            await self._update_tape_async(
-                prepared,
-                text,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.text_result(text)
-        if self._is_completed_responses_metadata_only(payload, transport=transport):
-            await self._update_tape_async(
-                prepared,
-                None,
-                response=payload,
-                provider=provider_name,
-                model=model_id,
-            )
-            return ToolAutoResult.text_result("")
-
-        raise RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-
-    def chat(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        **kwargs: Any,
-    ) -> str:
-        prepared = self._prepare_request(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=None,
-        )
-        try:
-            return self._execute_sync(
-                prepared,
-                tools_payload=None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_create_response, prepared),
-            )
-        except RepublicError as error:
-            self._update_tape(prepared, None, error=error)
-            raise
-
-    def tool_calls(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> list[dict[str, Any]]:
-        prepared = self._prepare_request(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-            require_tools=True,
-        )
-        try:
-            return self._execute_sync(
-                prepared,
-                tools_payload=prepared.toolset.payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_tool_calls_response, prepared),
-            )
-        except RepublicError as error:
-            self._update_tape(prepared, None, error=error)
-            raise
-
-    def run_tools(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> ToolAutoResult:
-        prepared = self._prepare_request(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-            require_tools=True,
-            require_runnable=True,
-        )
-        try:
-            return self._execute_sync(
-                prepared,
-                tools_payload=prepared.toolset.payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_tools_auto_response, prepared),
-            )
-        except RepublicError as error:
-            self._update_tape(prepared, None, error=error)
-            return ToolAutoResult.error_result(error)
-
-    async def chat_async(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        **kwargs: Any,
-    ) -> str:
-        prepared = await self._prepare_request_async(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=None,
-        )
-        try:
-            return await self._execute_async(
-                prepared,
-                tools_payload=None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_create_response_async, prepared),
-            )
-        except RepublicError as error:
-            await self._update_tape_async(prepared, None, error=error)
-            raise
-
-    async def tool_calls_async(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> list[dict[str, Any]]:
-        prepared = await self._prepare_request_async(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-            require_tools=True,
-        )
-        try:
-            return await self._execute_async(
-                prepared,
-                tools_payload=prepared.toolset.payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_tool_calls_response_async, prepared),
-            )
-        except RepublicError as error:
-            await self._update_tape_async(prepared, None, error=error)
-            raise
-
-    async def run_tools_async(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> ToolAutoResult:
-        prepared = await self._prepare_request_async(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-            require_tools=True,
-            require_runnable=True,
-        )
-        try:
-            return await self._execute_async(
-                prepared,
-                tools_payload=prepared.toolset.payload,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=False,
-                kwargs=kwargs,
-                on_response=partial(self._handle_tools_auto_response_async, prepared),
-            )
-        except RepublicError as error:
-            await self._update_tape_async(prepared, None, error=error)
-            return ToolAutoResult.error_result(error)
-
-    def stream(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        **kwargs: Any,
-    ) -> TextStream:
-        prepared = self._prepare_request(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=None,
-        )
-        try:
-            return self._execute_sync(
-                prepared,
-                tools_payload=None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=True,
-                kwargs=kwargs,
-                on_response=partial(self._build_text_stream, prepared),
-            )
-        except RepublicError as error:
-            return self._stream_error_result(prepared, error)
-
-    async def stream_async(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        **kwargs: Any,
-    ) -> AsyncTextStream:
-        prepared = await self._prepare_request_async(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=None,
-        )
-        try:
-            return await self._execute_async(
-                prepared,
-                tools_payload=None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=True,
-                kwargs=kwargs,
-                on_response=partial(self._build_async_text_stream, prepared),
-            )
-        except RepublicError as error:
-            return await self._stream_async_error_result(prepared, error)
-
-    def stream_events(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> StreamEvents:
-        prepared = self._prepare_request(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-        )
-        try:
-            return self._execute_sync(
-                prepared,
-                tools_payload=prepared.toolset.payload or None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=True,
-                kwargs=kwargs,
-                on_response=partial(self._build_event_stream, prepared),
-            )
-        except RepublicError as error:
-            return self._event_error_result(prepared, error)
-
-    async def stream_events_async(
-        self,
-        prompt: str | None = None,
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        provider: str | None = None,
-        messages: list[MessageInput] | None = None,
-        max_tokens: int | None = None,
-        tape: str | None = None,
-        context: TapeContext | None = None,
-        tools: ToolInput = None,
-        **kwargs: Any,
-    ) -> AsyncStreamEvents:
-        prepared = await self._prepare_request_async(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            tape=tape,
-            context=context,
-            tools=tools,
-        )
-        try:
-            return await self._execute_async(
-                prepared,
-                tools_payload=prepared.toolset.payload or None,
-                model=model,
-                provider=provider,
-                max_tokens=max_tokens,
-                stream=True,
-                kwargs=kwargs,
-                on_response=partial(self._build_async_event_stream, prepared),
-            )
-        except RepublicError as error:
-            return await self._event_async_error_result(prepared, error)
-
-    def _build_text_stream(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> TextStream:
-        payload, transport = self._unwrap_response(response)
-        if self._is_non_stream_response(payload, transport=transport):
-            text = self._extract_text(payload, transport=transport)
-            tool_calls = self._extract_tool_calls(payload, transport=transport)
-            state = StreamState()
-            self._finalize_text_stream(
-                prepared,
-                text=text or None,
-                tool_calls=tool_calls,
-                state=state,
-                provider_name=provider_name,
-                model_id=model_id,
-                attempt=attempt,
-                usage=self._extract_usage(payload, transport=transport),
-                response=payload,
-                log_empty=False,
-            )
-            return TextStream(iter([text]) if text else self._empty_iterator(), state=state)
-
-        state = StreamState()
-        parts: list[str] = []
-        assembler = ToolCallAssembler()
-
-        usage: dict[str, Any] | None = None
-        response_completed = False
-        output_item_types: set[str] = set()
-
-        def _iterator() -> Iterator[str]:
-            nonlocal usage, response_completed
-            try:
-                for chunk in payload:
-                    response_completed = response_completed or _field(chunk, "type") == "response.completed"
-                    output_item_type = self._responses_output_item_type(chunk, transport=transport)
-                    if output_item_type is not None:
-                        output_item_types.add(output_item_type)
-                    deltas = self._extract_chunk_tool_call_deltas(chunk, transport=transport)
-                    if deltas:
-                        assembler.add_deltas(deltas)
-                    text = self._extract_chunk_text(chunk, transport=transport)
-                    if text:
-                        parts.append(text)
-                        yield text
-                    usage = self._extract_usage(chunk, transport=transport) or usage
-            except Exception as exc:
-                state.error = self._core.wrap_error(exc, provider_name, model_id)
-            finally:
-                tool_calls = assembler.finalize()
-                self._finalize_text_stream(
-                    prepared,
-                    text="".join(parts) if parts else None,
-                    tool_calls=tool_calls,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    attempt=attempt,
-                    usage=usage,
-                    log_empty=True,
-                    completed_metadata_only=self._is_completed_responses_stream_metadata_only(
-                        completed=response_completed,
-                        output_item_types=output_item_types,
-                    ),
-                )
-
-        return TextStream(_iterator(), state=state)
-
-    async def _build_async_text_stream(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> AsyncTextStream:
-        payload, transport = self._unwrap_response(response)
-        if self._is_non_stream_response(payload, transport=transport):
-            text = self._extract_text(payload, transport=transport)
-            tool_calls = self._extract_tool_calls(payload, transport=transport)
-            state = StreamState()
-            await self._finalize_text_stream_async(
-                prepared,
-                text=text or None,
-                tool_calls=tool_calls,
-                state=state,
-                provider_name=provider_name,
-                model_id=model_id,
-                attempt=attempt,
-                usage=self._extract_usage(payload, transport=transport),
-                response=payload,
-                log_empty=False,
-            )
-
-            async def _single() -> AsyncIterator[str]:
-                if text:
-                    yield text
-
-            return AsyncTextStream(_single(), state=state)
-
-        state = StreamState()
-        parts: list[str] = []
-        usage: dict[str, Any] | None = None
-        assembler = ToolCallAssembler()
-        response_completed = False
-        output_item_types: set[str] = set()
-
-        async def _iterator() -> AsyncIterator[str]:
-            nonlocal usage, response_completed
+        async def _stream_iterator():
             try:
                 async for chunk in payload:
-                    response_completed = response_completed or _field(chunk, "type") == "response.completed"
-                    output_item_type = self._responses_output_item_type(chunk, transport=transport)
+                    # response_completed = _field(chunk, "type") == "response.completed"
+                    output_item_type = _responses_output_item_type(chunk, transport=transport)
                     if output_item_type is not None:
-                        output_item_types.add(output_item_type)
-                    deltas = self._extract_chunk_tool_call_deltas(chunk, transport=transport)
-                    if deltas:
-                        assembler.add_deltas(deltas)
-                    text = self._extract_chunk_text(chunk, transport=transport)
+                        accumulator.output_item_types.add(output_item_type)
+
+                    usage = _extract_usage(chunk, transport=transport)
+                    if usage is not None:
+                        accumulator.usage = usage
+
+                    accumulator.assembler.add_deltas(_extract_chunk_tool_call_deltas(chunk, transport=transport))
+
+                    text, reasoning = _extract_chunk_text(chunk, transport=transport)
                     if text:
-                        parts.append(text)
-                        yield text
-                    usage = self._extract_usage(chunk, transport=transport) or usage
+                        accumulator.text_parts.append(text)
+                        accumulator.reasoning_parts.append(reasoning or "")
+                        yield TextEvent(content=text, reasoning=reasoning)
+
+                result = accumulator.to_result(prepared)
+                if not result.text and not result.tool_calls and not result.metadata_only:
+                        raise RepublicError(
+                            # it's safe to retry on this condition
+                            ErrorKind.TEMPORARY,
+                            f"{provider}:{model}: empty response stream (attempt {attempt})",
+                        )
+
+                yield FinalEvent(result=result)
             except Exception as exc:
-                state.error = self._core.wrap_error(exc, provider_name, model_id)
-            finally:
-                tool_calls = assembler.finalize()
-                await self._finalize_text_stream_async(
-                    prepared,
-                    text="".join(parts) if parts else None,
-                    tool_calls=tool_calls,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    attempt=attempt,
-                    usage=usage,
-                    log_empty=True,
-                    completed_metadata_only=self._is_completed_responses_stream_metadata_only(
-                        completed=response_completed,
-                        output_item_types=output_item_types,
-                    ),
-                )
+                error = self._core.wrap_error(exc, provider or "", model or "")
+                yield ErrorEvent(error)
 
-        return AsyncTextStream(_iterator(), state=state)
-
-    @staticmethod
-    def _extract_chunk_tool_call_deltas(
-        chunk: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> list[Any]:
-        parser = ChatClient._parser_for_payload(chunk, transport=transport)
-        return parser.extract_chunk_tool_call_deltas(chunk)
-
-    @staticmethod
-    def _extract_chunk_text(
-        chunk: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> str:
-        parser = ChatClient._parser_for_payload(chunk, transport=transport)
-        return parser.extract_chunk_text(chunk)
-
-    def _build_event_stream(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> StreamEvents:
-        payload, transport = self._unwrap_response(response)
-        if self._is_non_stream_response(payload, transport=transport):
-            return self._build_event_stream_from_response(
-                prepared,
-                payload,
-                provider_name,
-                model_id,
-                transport=transport,
-            )
-
-        state = StreamState()
-        usage: dict[str, Any] | None = None
-        parts: list[str] = []
-        tool_calls: list[dict[str, Any]] | None = None
-        tool_results: list[Any] = []
-        assembler = ToolCallAssembler()
-        response_completed = False
-        output_item_types: set[str] = set()
-
-        def _iterator() -> Iterator[StreamEvent]:
-            nonlocal usage, tool_calls, tool_results, response_completed
-            try:
-                for chunk in payload:
-                    response_completed = response_completed or _field(chunk, "type") == "response.completed"
-                    output_item_type = self._responses_output_item_type(chunk, transport=transport)
-                    if output_item_type is not None:
-                        output_item_types.add(output_item_type)
-                    usage = self._extract_usage(chunk, transport=transport) or usage
-                    assembler.add_deltas(self._extract_chunk_tool_call_deltas(chunk, transport=transport))
-                    text = self._extract_chunk_text(chunk, transport=transport)
-                    if text:
-                        parts.append(text)
-                        yield StreamEvent("text", {"delta": text})
-
-                tool_calls = assembler.finalize()
-                events, tool_results = self._finalize_event_stream(
-                    prepared,
-                    parts=parts,
-                    tool_calls=tool_calls,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    attempt=attempt,
-                    usage=usage,
-                    completed_metadata_only=self._is_completed_responses_stream_metadata_only(
-                        completed=response_completed,
-                        output_item_types=output_item_types,
-                    ),
-                )
-                yield from events
-            except Exception as exc:
-                state.error = self._core.wrap_error(exc, provider_name, model_id)
-                final_calls = tool_calls or assembler.finalize()
-                yield from self._error_event_sequence(
-                    parts=parts,
-                    tool_calls=final_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                )
-            finally:
-                tool_calls = self._finalize_event_stream_state(
-                    prepared,
-                    parts=parts,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    usage=usage,
-                    assembler=assembler,
-                )
-
-        return StreamEvents(_iterator(), state=state)
-
-    def _build_async_event_stream(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        attempt: int,
-    ) -> AsyncStreamEvents:
-        payload, transport = self._unwrap_response(response)
-        if self._is_non_stream_response(payload, transport=transport):
-            return self._build_async_event_stream_from_response(
-                prepared,
-                payload,
-                provider_name,
-                model_id,
-                transport=transport,
-            )
-
-        state = StreamState()
-        usage: dict[str, Any] | None = None
-        parts: list[str] = []
-        tool_calls: list[dict[str, Any]] | None = None
-        tool_results: list[Any] = []
-        assembler = ToolCallAssembler()
-        response_completed = False
-        output_item_types: set[str] = set()
-
-        async def _iterator() -> AsyncIterator[StreamEvent]:
-            nonlocal usage, tool_calls, tool_results, response_completed
-            try:
-                async for chunk in payload:
-                    response_completed = response_completed or _field(chunk, "type") == "response.completed"
-                    output_item_type = self._responses_output_item_type(chunk, transport=transport)
-                    if output_item_type is not None:
-                        output_item_types.add(output_item_type)
-                    usage = self._extract_usage(chunk, transport=transport) or usage
-                    assembler.add_deltas(self._extract_chunk_tool_call_deltas(chunk, transport=transport))
-                    text = self._extract_chunk_text(chunk, transport=transport)
-                    if text:
-                        parts.append(text)
-                        yield StreamEvent("text", {"delta": text})
-
-                tool_calls = assembler.finalize()
-                events, tool_results = await self._finalize_event_stream_async(
-                    prepared,
-                    parts=parts,
-                    tool_calls=tool_calls,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    attempt=attempt,
-                    usage=usage,
-                    completed_metadata_only=self._is_completed_responses_stream_metadata_only(
-                        completed=response_completed,
-                        output_item_types=output_item_types,
-                    ),
-                )
-                for event in events:
-                    yield event
-            except Exception as exc:
-                state.error = self._core.wrap_error(exc, provider_name, model_id)
-                final_calls = tool_calls or assembler.finalize()
-                for event in self._error_event_sequence(
-                    parts=parts,
-                    tool_calls=final_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                ):
-                    yield event
-            finally:
-                tool_calls = await self._finalize_event_stream_state_async(
-                    prepared,
-                    parts=parts,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    state=state,
-                    provider_name=provider_name,
-                    model_id=model_id,
-                    usage=usage,
-                    assembler=assembler,
-                )
-
-        return AsyncStreamEvents(_iterator(), state=state)
-
-    def _build_event_stream_from_response(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        *,
-        transport: TransportKind | None = None,
-    ) -> StreamEvents:
-        text = self._extract_text(response, transport=transport)
-        tool_calls = self._extract_tool_calls(response, transport=transport)
-        usage = self._extract_usage(response, transport=transport)
-        state = StreamState(usage=usage)
-        tool_results: list[Any] = []
-        if (
-            not text
-            and not tool_calls
-            and state.error is None
-            and not self._is_completed_responses_metadata_only(response, transport=transport)
-        ):
-            empty = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-            self._core.log_error(empty, provider_name, model_id, 0)
-            state.error = RepublicError(empty.kind, empty.message)
-        events: list[StreamEvent] = []
-        if text:
-            events.append(StreamEvent("text", {"delta": text}))
-        for idx, call in enumerate(tool_calls):
-            events.append(StreamEvent("tool_call", {"index": idx, "call": call}))
-        try:
-            tool_results = self._execute_tool_calls(prepared, tool_calls, provider_name, model_id)
-        except RepublicError as exc:
-            state.error = exc
-        for idx, result in enumerate(tool_results):
-            events.append(StreamEvent("tool_result", {"index": idx, "result": result}))
-        if state.error is not None:
-            events.append(StreamEvent("error", state.error.as_dict()))
-        if usage is not None:
-            events.append(StreamEvent("usage", usage))
-        events.append(
-            StreamEvent(
-                "final",
-                self._final_event_data(
-                    text=text or None,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                ),
-            )
-        )
-        self._update_tape(
-            prepared,
-            text or None,
-            tool_calls=tool_calls or None,
-            tool_results=tool_results or None,
-            error=state.error,
-            response=response,
-            provider=provider_name,
-            model=model_id,
-            usage=usage,
-        )
-        return StreamEvents(iter(events), state=state)
-
-    def _build_async_event_stream_from_response(
-        self,
-        prepared: PreparedChat,
-        response: Any,
-        provider_name: str,
-        model_id: str,
-        *,
-        transport: TransportKind | None = None,
-    ) -> AsyncStreamEvents:
-        text = self._extract_text(response, transport=transport)
-        tool_calls = self._extract_tool_calls(response, transport=transport)
-        usage = self._extract_usage(response, transport=transport)
-        state = StreamState(usage=usage)
-        tool_results: list[Any] = []
-
-        async def _iterator() -> AsyncIterator[StreamEvent]:
-            nonlocal tool_results
-            if (
-                not text
-                and not tool_calls
-                and state.error is None
-                and not self._is_completed_responses_metadata_only(response, transport=transport)
-            ):
-                empty = RepublicError(ErrorKind.TEMPORARY, f"{provider_name}:{model_id}: empty response")
-                self._core.log_error(empty, provider_name, model_id, 0)
-                state.error = RepublicError(empty.kind, empty.message)
-
-            if text:
-                yield StreamEvent("text", {"delta": text})
-            for idx, call in enumerate(tool_calls):
-                yield StreamEvent("tool_call", {"index": idx, "call": call})
-            try:
-                tool_results = await self._execute_tool_calls_async(prepared, tool_calls, provider_name, model_id)
-            except RepublicError as exc:
-                state.error = exc
-            for idx, result in enumerate(tool_results):
-                yield StreamEvent("tool_result", {"index": idx, "result": result})
-            if state.error is not None:
-                yield StreamEvent("error", state.error.as_dict())
-            if usage is not None:
-                yield StreamEvent("usage", usage)
-            yield StreamEvent(
-                "final",
-                self._final_event_data(
-                    text=text or None,
-                    tool_calls=tool_calls,
-                    tool_results=tool_results,
-                    usage=usage,
-                    error=state.error,
-                ),
-            )
-
-            await self._update_tape_async(
-                prepared,
-                text or None,
-                tool_calls=tool_calls or None,
-                tool_results=tool_results or None,
-                error=state.error,
-                response=response,
-                provider=provider_name,
-                model=model_id,
-                usage=usage,
-            )
-
-        return AsyncStreamEvents(_iterator(), state=state)
-
-    def _execute_tool_calls(
-        self,
-        prepared: PreparedChat,
-        tool_calls: list[dict[str, Any]],
-        provider_name: str,
-        model_id: str,
-    ) -> list[Any]:
-        if not tool_calls:
-            return []
-        if not prepared.toolset.runnable:
-            raise RepublicError(ErrorKind.TOOL, "No runnable tools are available.")
-        execution = self._tool_executor.execute(
-            tool_calls,
-            tools=prepared.toolset.runnable,
-            context=self._make_tool_context(prepared, provider_name, model_id),
-        )
-        return execution.tool_results
-
-    async def _execute_tool_calls_async(
-        self,
-        prepared: PreparedChat,
-        tool_calls: list[dict[str, Any]],
-        provider_name: str,
-        model_id: str,
-    ) -> list[Any]:
-        if not tool_calls:
-            return []
-        if not prepared.toolset.runnable:
-            raise RepublicError(ErrorKind.TOOL, "No runnable tools are available.")
-        execution = await self._tool_executor.execute_async(
-            tool_calls,
-            tools=prepared.toolset.runnable,
-            context=self._make_tool_context(prepared, provider_name, model_id),
-        )
-        return execution.tool_results
-
-    @staticmethod
-    def _make_tool_context(prepared: PreparedChat, provider_name: str, model_id: str) -> ToolContext:
-        return ToolContext(
-            tape=prepared.tape,
-            run_id=prepared.run_id,
-            meta={"provider": provider_name, "model": model_id},
-            state={} if prepared.context is None else prepared.context.state,
-        )
-
-    @staticmethod
-    def _extract_text(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> str:
-        payload, parser = ChatClient._unwrap_response_with_parser(response, transport=transport)
-        return parser.extract_text(payload)
-
-    @staticmethod
-    def _extract_tool_calls(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> list[dict[str, Any]]:
-        payload, parser = ChatClient._unwrap_response_with_parser(response, transport=transport)
-        return parser.extract_tool_calls(payload)
-
-    @staticmethod
-    def _extract_usage(
-        response: Any,
-        *,
-        transport: TransportKind | None = None,
-    ) -> dict[str, Any] | None:
-        payload, parser = ChatClient._unwrap_response_with_parser(response, transport=transport)
-        return parser.extract_usage(payload)
+        # Return immediately — preserves real-time streaming nature
+        return AsyncStreamEvents(_stream_iterator())

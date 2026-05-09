@@ -89,49 +89,7 @@ def _save_github_copilot_tokens(
     )
 
 
-def test_llm_uses_api_key_resolver_when_api_key_is_missing(monkeypatch) -> None:
-    factory, created = _setup_anyllm_create(monkeypatch)
 
-    client = factory.ensure("openai")
-    client.queue_completion(make_response(text="ok"))
-
-    llm = LLM(
-        model="openai:gpt-5.3-codex",
-        api_key_resolver=lambda provider: "oauth-token" if provider == "openai" else None,
-    )
-    assert llm.chat("hello") == "ok"
-    assert created[0][0] == "openai"
-    assert created[0][1]["api_key"] == "oauth-token"
-
-
-def test_explicit_api_key_has_priority_over_resolver(monkeypatch) -> None:
-    factory, created = _setup_anyllm_create(monkeypatch)
-
-    client = factory.ensure("openai")
-    client.queue_completion(make_response(text="ok"))
-
-    llm = LLM(
-        model="openai:gpt-5.3-codex",
-        api_key={"openai": "explicit-key"},
-        api_key_resolver=lambda _: "oauth-token",
-    )
-    assert llm.chat("hello") == "ok"
-    assert created[0][1]["api_key"] == "explicit-key"
-
-
-def test_provider_map_falls_back_to_resolver_for_missing_provider(monkeypatch) -> None:
-    factory, created = _setup_anyllm_create(monkeypatch)
-
-    client = factory.ensure("openai")
-    client.queue_completion(make_response(text="ok"))
-
-    llm = LLM(
-        model="openai:gpt-5.3-codex",
-        api_key={"anthropic": "anthropic-key"},
-        api_key_resolver=lambda provider: "oauth-token" if provider == "openai" else None,
-    )
-    assert llm.chat("hello") == "ok"
-    assert created[0][1]["api_key"] == "oauth-token"
 
 
 def test_codex_cli_api_key_resolver_reads_access_token(tmp_path) -> None:

@@ -18,12 +18,12 @@ class BaseTransportParser(ABC):
         """Extract tool call deltas from a response chunk, if present."""
 
     @abstractmethod
-    def extract_chunk_text(self, chunk: Any) -> str:
-        """Extract text from a response chunk."""
+    def extract_chunk_text(self, chunk: Any) -> tuple[str | None, str | None]:
+        """Extract (content, reasoning_content) from a response chunk."""
 
     @abstractmethod
-    def extract_text(self, response: Any) -> str:
-        """Extract text from a response."""
+    def extract_text(self, response: Any) -> tuple[str, str | None]:
+        """Extract (content, reasoning_content) from a response."""
 
     @abstractmethod
     def extract_tool_calls(self, response: Any) -> list[dict[str, Any]]:
@@ -32,3 +32,4 @@ class BaseTransportParser(ABC):
     @abstractmethod
     def extract_usage(self, response: Any) -> dict[str, Any] | None:
         """Extract usage information from a response, if present."""
+

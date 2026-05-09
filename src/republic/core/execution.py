@@ -69,7 +69,35 @@ class TransportCallRequest:
 
 
 class LLMCore:
-    """Shared LLM execution utilities (provider resolution, retries, client cache)."""
+    """Shared LLM execution utilities (provider resolution, retries, client cache).
+
+    All LLM calls are async.  The main entry-point is ``run_chat_async``,
+    which implements a retry/fallback waterfall and delegates the actual
+    response handling to a caller-supplied CPS continuation.
+
+    CPS callback (``on_response``)
+    ------------------------------
+    ``run_chat_async`` does not return the raw ``TransportResponse`` to the
+    caller directly.  Instead the caller provides a continuation callback::
+
+        on_response(response, provider, model, attempt) -> Any
+
+    Args passed to the callback:
+        response:  The ``TransportResponse`` produced by the any-llm client
+                   for the current attempt.
+        provider:  The provider name string for the model that was called.
+        model:     The model id string for the model that was called.
+        attempt:   0-based attempt counter for the current model.
+
+    The callback may:
+      * Return a value — this becomes the return value of ``run_chat_async``.
+      * Raise ``RepublicError`` with ``kind == ErrorKind.TEMPORARY`` to
+        trigger an immediate retry of the *same* model.
+      * Raise any other exception — aborts the retry waterfall and propagates.
+
+    This design keeps transport-level retry logic inside ``LLMCore`` while
+    letting the caller own parsing, validation, and result-type decisions.
+    """
 
     def __init__(
         self,
@@ -475,52 +503,6 @@ class LLMCore:
             raise RepublicError(ErrorKind.INVALID_INPUT, f"{provider_name}:{model_id}: {reason}")
         return "responses"
 
-    def _call_responses_sync(
-        self,
-        request: TransportCallRequest,
-    ) -> Any:
-        instructions, input_items = self._split_messages_for_responses(request.messages_payload)
-        responses_kwargs = self._with_responses_reasoning(request.kwargs, request.reasoning_effort)
-        return TransportResponse(
-            transport="responses",
-            payload=request.client.responses(
-                model=request.model_id,
-                input_data=input_items,
-                tools=self._convert_tools_for_responses(request.tools_payload),
-                stream=request.stream,
-                instructions=instructions,
-                **self._decide_responses_kwargs(
-                    request.max_tokens,
-                    responses_kwargs,
-                    drop_extra_headers=not self._preserves_responses_extra_headers(request.client),
-                ),
-            ),
-        )
-
-    def _call_completion_like_sync(
-        self,
-        *,
-        transport: Literal["completion", "messages"],
-        request: TransportCallRequest,
-    ) -> Any:
-        completion_kwargs = self._decide_kwargs_for_provider(request.provider_name, request.max_tokens, request.kwargs)
-        completion_kwargs = self._with_default_completion_stream_options(
-            request.provider_name,
-            request.stream,
-            completion_kwargs,
-        )
-        return TransportResponse(
-            transport=transport,
-            payload=request.client.completion(
-                model=request.model_id,
-                messages=request.messages_payload,
-                tools=request.tools_payload,
-                stream=request.stream,
-                reasoning_effort=request.reasoning_effort,
-                **completion_kwargs,
-            ),  # ty: ignore[no-matching-overload]
-        )
-
     async def _call_responses_async(
         self,
         request: TransportCallRequest,
@@ -561,7 +543,7 @@ class LLMCore:
         )
         return TransportResponse(
             transport=transport,
-            payload=await request.client.acompletion(
+            payload= await request.client.acompletion(
                 model=request.model_id,
                 messages=request.messages_payload,
                 tools=request.tools_payload,
@@ -570,40 +552,6 @@ class LLMCore:
                 **completion_kwargs,
             ),
         )
-
-    def _call_client_sync(
-        self,
-        *,
-        client: AnyLLM,
-        provider_name: str,
-        model_id: str,
-        messages_payload: list[dict[str, Any]],
-        tools_payload: list[dict[str, Any]] | None,
-        max_tokens: int | None,
-        stream: bool,
-        reasoning_effort: Any | None,
-        kwargs: dict[str, Any],
-    ) -> Any:
-        request = TransportCallRequest(
-            client=client,
-            provider_name=provider_name,
-            model_id=model_id,
-            messages_payload=messages_payload,
-            tools_payload=tools_payload,
-            max_tokens=max_tokens,
-            stream=stream,
-            reasoning_effort=reasoning_effort,
-            kwargs=kwargs,
-        )
-        transport = self._selected_transport(
-            client,
-            provider_name=provider_name,
-            model_id=model_id,
-            tools_payload=tools_payload,
-        )
-        if transport == "responses":
-            return self._call_responses_sync(request)
-        return self._call_completion_like_sync(transport=transport, request=request)
 
     async def _call_client_async(
         self,
@@ -693,62 +641,6 @@ class LLMCore:
                     "output": message.get("content", ""),
                 })
         return input_items
-
-    def run_chat_sync(
-        self,
-        *,
-        messages_payload: list[dict[str, Any]],
-        tools_payload: list[dict[str, Any]] | None,
-        model: str | None,
-        provider: str | None,
-        max_tokens: int | None,
-        stream: bool,
-        reasoning_effort: Any | None,
-        kwargs: dict[str, Any],
-        on_response: Callable[[Any, str, str, int], Any],
-    ) -> Any:
-        last_provider: str | None = None
-        last_model: str | None = None
-        last_error: RepublicError | None = None
-        for provider_name, model_id, client in self.iter_clients(model, provider):
-            last_provider, last_model = provider_name, model_id
-            for attempt in range(self.max_attempts()):
-                try:
-                    response = self._call_client_sync(
-                        client=client,
-                        provider_name=provider_name,
-                        model_id=model_id,
-                        messages_payload=messages_payload,
-                        tools_payload=tools_payload,
-                        max_tokens=max_tokens,
-                        stream=stream,
-                        reasoning_effort=reasoning_effort,
-                        kwargs=kwargs,
-                    )
-                except Exception as exc:
-                    outcome = self._handle_attempt_error(exc, provider_name, model_id, attempt)
-                    last_error = outcome.error
-                    if outcome.decision is AttemptDecision.RETRY_SAME_MODEL:
-                        continue
-                    break
-                else:
-                    try:
-                        result = on_response(response, provider_name, model_id, attempt)
-                    except RepublicError as exc:
-                        self.log_error(exc, provider_name, model_id, attempt)
-                        if exc.kind == ErrorKind.TEMPORARY:
-                            continue
-                        raise
-                    return result
-
-        if last_error is not None:
-            raise last_error
-        if last_provider and last_model:
-            raise RepublicError(
-                ErrorKind.TEMPORARY,
-                f"{last_provider}:{last_model}: LLM call failed after retries",
-            )
-        raise RepublicError(ErrorKind.TEMPORARY, "LLM call failed after retries")
 
     async def run_chat_async(  # noqa: C901
         self,

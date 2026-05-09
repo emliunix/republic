@@ -242,7 +242,7 @@ def tool_from_model(
     )
 
 
-ToolInput = ToolSet | Sequence[Any] | None
+type ToolInput = ToolSet | Sequence[Any] | None
 
 
 @dataclass(frozen=True)

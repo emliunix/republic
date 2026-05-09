@@ -18,18 +18,6 @@ if TYPE_CHECKING:
     from republic.tape.query import TapeQuery
 
 
-class TapeStore(Protocol):
-    """Append-only tape storage interface."""
-
-    def list_tapes(self) -> list[str]: ...
-
-    def reset(self, tape: str) -> None: ...
-
-    def fetch_all(self, query: TapeQuery) -> Iterable[TapeEntry]: ...
-
-    def append(self, tape: str, entry: TapeEntry) -> None: ...
-
-
 class AsyncTapeStore(Protocol):
     """Async append-only tape storage interface."""
 
@@ -42,7 +30,7 @@ class AsyncTapeStore(Protocol):
     async def append(self, tape: str, entry: TapeEntry) -> None: ...
 
 
-def is_async_tape_store(store: TapeStore | AsyncTapeStore) -> TypeGuard[AsyncTapeStore]:
+def is_async_tape_store(store: AsyncTapeStore) -> TypeGuard[AsyncTapeStore]:
     return hasattr(store, "append") and inspect.iscoroutinefunction(store.append)
 
 
@@ -114,7 +102,7 @@ class InMemoryQueryMixin:
     def read(self, tape: str) -> list[TapeEntry] | None:
         raise NotImplementedError("InMemoryQueryMixin requires a read() method to be implemented.")
 
-    def fetch_all(self, query: TapeQuery) -> Iterable[TapeEntry]:  # noqa: C901
+    async def fetch_all(self, query: TapeQuery) -> Iterable[TapeEntry]:  # noqa: C901
         entries = self.read(query.tape) or []
         start_index = 0
         end_index: int | None = None
@@ -157,17 +145,17 @@ class InMemoryQueryMixin:
         return sliced
 
 
-class InMemoryTapeStore(InMemoryQueryMixin):
+class InMemoryTapeStore(InMemoryQueryMixin, AsyncTapeStore):
     """In-memory tape storage (not thread-safe)."""
 
     def __init__(self) -> None:
         self._tapes: dict[str, list[TapeEntry]] = {}
         self._next_id: dict[str, int] = {}
 
-    def list_tapes(self) -> list[str]:
+    async def list_tapes(self) -> list[str]:
         return sorted(self._tapes.keys())
 
-    def reset(self, tape: str) -> None:
+    async def reset(self, tape: str) -> None:
         self._tapes.pop(tape, None)
         self._next_id.pop(tape, None)
 
@@ -177,30 +165,11 @@ class InMemoryTapeStore(InMemoryQueryMixin):
             return None
         return [entry.copy() for entry in entries]
 
-    def append(self, tape: str, entry: TapeEntry) -> None:
+    async def append(self, tape: str, entry: TapeEntry) -> None:
         next_id = self._next_id.get(tape, 1)
         self._next_id[tape] = next_id + 1
         stored = TapeEntry(next_id, entry.kind, dict(entry.payload), dict(entry.meta), entry.date)
         self._tapes.setdefault(tape, []).append(stored)
-
-
-class AsyncTapeStoreAdapter:
-    """Adapt a sync TapeStore to AsyncTapeStore."""
-
-    def __init__(self, store: TapeStore) -> None:
-        self._store = store
-
-    async def list_tapes(self) -> list[str]:
-        return await asyncio.to_thread(self._store.list_tapes)
-
-    async def reset(self, tape: str) -> None:
-        await asyncio.to_thread(self._store.reset, tape)
-
-    async def fetch_all(self, query: TapeQuery) -> Iterable[TapeEntry]:
-        return await asyncio.to_thread(self._store.fetch_all, query)
-
-    async def append(self, tape: str, entry: TapeEntry) -> None:
-        await asyncio.to_thread(self._store.append, tape, entry)
 
 
 class UnavailableTapeStore:

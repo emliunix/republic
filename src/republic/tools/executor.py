@@ -9,9 +9,18 @@ from typing import Any, NoReturn
 
 from pydantic import ValidationError
 
+from dataclasses import dataclass, field
+
 from republic.core.errors import ErrorKind
-from republic.core.results import RepublicError, ToolExecution
+from republic.core.results import RepublicError
 from republic.tools.context import ToolContext
+
+
+@dataclass(frozen=True)
+class ToolExecution:
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_results: list[Any] = field(default_factory=list)
+    error: RepublicError | None = None
 from republic.tools.schema import Tool, ToolInput, normalize_tools
 
 

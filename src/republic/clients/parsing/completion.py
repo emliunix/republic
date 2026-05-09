@@ -21,26 +21,30 @@ class CompletionTransportParser(BaseTransportParser):
             return []
         return field(delta, "tool_calls") or []
 
-    def extract_chunk_text(self, chunk: Any) -> str:
+    def extract_chunk_text(self, chunk: Any) -> tuple[str | None, str | None]:
         choices = field(chunk, "choices")
         if not choices:
-            return ""
+            return None, None
         delta = field(choices[0], "delta")
         if delta is None:
-            return ""
-        return field(delta, "content", "") or ""
+            return None, None
+        content = field(delta, "content", "") or ""
+        reasoning = field(delta, "reasoning_content", "") or None
+        return content, reasoning
 
-    def extract_text(self, response: Any) -> str:
+    def extract_text(self, response: Any) -> tuple[str, str | None]:
         if isinstance(response, str):
-            return response
+            return response, None
 
         choices = field(response, "choices")
         if not choices:
-            return ""
+            return "", None
         message = field(choices[0], "message")
         if message is None:
-            return ""
-        return field(message, "content", "") or ""
+            return "", None
+        content = field(message, "content", "") or ""
+        reasoning = field(message, "reasoning_content") or None
+        return content, reasoning
 
     def extract_tool_calls(self, response: Any) -> list[dict[str, Any]]:
         choices = field(response, "choices")
@@ -69,6 +73,12 @@ class CompletionTransportParser(BaseTransportParser):
                 entry["type"] = call_type
             calls.append(entry)
         return expand_tool_calls(calls)
+
+    def extract_reasoning(self, response: Any) -> dict | None:
+        return None
+
+    def extract_chunk_reasoning(self, chunk: Any) -> str:
+        return ""
 
     def extract_usage(self, response: Any) -> dict[str, Any] | None:
         usage = field(response, "usage")

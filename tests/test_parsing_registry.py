@@ -36,7 +36,4 @@ def test_responses_extract_tool_calls_accepts_full_response() -> None:
     assert calls[0]["function"]["name"] == "echo"
 
 
-def test_chat_client_resolve_transport_treats_output_text_as_responses() -> None:
-    payload = SimpleNamespace(output_text="hello")
-    assert ChatClient._is_non_stream_response(payload) is True
-    assert ChatClient._extract_text(payload) == "hello"
+

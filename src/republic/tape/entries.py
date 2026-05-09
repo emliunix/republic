@@ -43,10 +43,17 @@ class TapeEntry:
 
     @classmethod
     def tool_call(cls, calls: list[dict[str, Any]], **meta: Any) -> TapeEntry:
+        """
+        call: { id: str, type: function, function: { name: str, arguments: dict[str, Any] } } }
+        """
         return cls(id=0, kind="tool_call", payload={"calls": calls}, meta=dict(meta))
 
     @classmethod
     def tool_result(cls, results: list[Any], **meta: Any) -> TapeEntry:
+        """
+        .context.build_messages will reconstruct the tool message combining tool_call and tool_result
+        result: str
+        """
         return cls(id=0, kind="tool_result", payload={"results": results}, meta=dict(meta))
 
     @classmethod

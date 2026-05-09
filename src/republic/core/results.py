@@ -2,151 +2,143 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Generic, TypeVar
 
 from republic.core.errors import RepublicError
 
+T = TypeVar("T")
+
 
 @dataclass
-class StreamState:
-    error: RepublicError | None = None
-    usage: dict[str, Any] | None = None
+class PreparedChat:
+    """Execution configuration for one LLM API call.
 
+    Does NOT contain messages — messages are always retrieved from tape
+    by TapeSession.run(). This enforces the single abstraction: the tape
+    is the source of truth for conversation state.
 
-class TextStream:
-    def __init__(self, iterator: Iterator[str], *, state: StreamState | None = None) -> None:
-        self._iterator = iterator
-        self._state = state or StreamState()
+    Users with fixed messages should use InMemoryTapeStore.
 
-    def __iter__(self) -> Iterator[str]:
-        return self._iterator
+    Note: stream vs non-stream is encoded by which method is called (chat() vs stream()),
+    not by a field in PreparedChat.
 
-    @property
-    def error(self) -> RepublicError | None:
-        return self._state.error
+    Not frozen: kwargs is a mutable dict (common practice for **kwargs capture).
+    Treated as immutable in practice; mutations are not supported.
+    """
 
-    @property
-    def usage(self) -> dict[str, Any] | None:
-        return self._state.usage
-
-
-class AsyncTextStream:
-    def __init__(self, iterator: AsyncIterator[str], *, state: StreamState | None = None) -> None:
-        self._iterator = iterator
-        self._state = state or StreamState()
-
-    def __aiter__(self) -> AsyncIterator[str]:
-        return self._iterator
+    model: str
+    provider: str
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    max_tokens: int | None = None
+    reasoning_effort: Any | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    run_id: str = field(default_factory=lambda: __import__("uuid").uuid4().hex)
 
     @property
-    def error(self) -> RepublicError | None:
-        return self._state.error
-
-    @property
-    def usage(self) -> dict[str, Any] | None:
-        return self._state.usage
+    def core_kwargs(self) -> dict[str, Any]:
+        return {
+            "tools_payload": list(self.tools) or None,
+            "model": self.model,
+            "provider": self.provider,
+            "max_tokens": self.max_tokens,
+            "reasoning_effort": self.reasoning_effort,
+            "kwargs": self.kwargs,
+        }
 
 
 @dataclass(frozen=True)
-class StreamEvent:
-    kind: Literal[
-        "text",
-        "tool_call",
-        "tool_result",
-        "usage",
-        "error",
-        "final",
-    ]
-    data: dict[str, Any]
+class LLMResult:
+    """Complete outcome of a single LLM turn.
 
+    This is the internal representation used by ChatClient.
+    TapeSession.run() converts this to TurnResult (Finished | ToolCallNeeded)
+    based on whether tool_calls are present.
+    """
 
-class StreamEvents:
-    def __init__(self, iterator: Iterator[StreamEvent], *, state: StreamState | None = None) -> None:
-        self._iterator = iterator
-        self._state = state or StreamState()
-
-    def __iter__(self) -> Iterator[StreamEvent]:
-        return self._iterator
-
-    @property
-    def error(self) -> RepublicError | None:
-        return self._state.error
-
-    @property
-    def usage(self) -> dict[str, Any] | None:
-        return self._state.usage
-
-
-class AsyncStreamEvents:
-    def __init__(self, iterator: AsyncIterator[StreamEvent], *, state: StreamState | None = None) -> None:
-        self._iterator = iterator
-        self._state = state or StreamState()
-
-    def __aiter__(self) -> AsyncIterator[StreamEvent]:
-        return self._iterator
-
-    @property
-    def error(self) -> RepublicError | None:
-        return self._state.error
-
-    @property
-    def usage(self) -> dict[str, Any] | None:
-        return self._state.usage
-
-
-@dataclass(frozen=True)
-class ToolExecution:
+    request: PreparedChat
+    text: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    tool_results: list[Any] = field(default_factory=list)
-    error: RepublicError | None = None
+    reasoning: str | None = None
+    usage: dict[str, Any] | None = None
+    metadata_only: bool = False
 
 
 @dataclass(frozen=True)
-class ToolAutoResult:
-    kind: Literal["text", "tools", "error"]
-    text: str | None
+class TextEvent:
+    content: str | None = None
+    reasoning: str | None = None
+
+
+@dataclass(frozen=True)
+class FinalEvent(Generic[T]):
+    result: T
+
+
+@dataclass(frozen=True)
+class ErrorEvent:
+    error: RepublicError
+
+
+# Union type for streaming events
+type StreamEvent[T] = TextEvent | FinalEvent[T] | ErrorEvent
+
+
+class AsyncStreamEvents(Generic[T]):
+    """Wrapper over async generator that allows setup work in coroutine body.
+
+    chat() returns LLMResult directly.
+    stream() returns AsyncStreamEvents[LLMResult] which yields TextEvent | FinalEvent[LLMResult] | ErrorEvent.
+    """
+
+    def __init__(self, iterator: AsyncIterator[StreamEvent[T]]) -> None:
+        self._iterator = iterator
+
+    def __aiter__(self) -> AsyncIterator[StreamEvent[T]]:
+        return self._iterator
+
+
+# =============================================================================
+# TURN RESULT TYPES (orchestration layer)
+# =============================================================================
+
+@dataclass(frozen=True)
+class Finished:
+    """LLM turn completed with final response."""
+
+    result: LLMResult
+
+
+@dataclass(frozen=True)
+class ToolCallNeeded:
+    """LLM turn requires tool execution before continuing.
+
+    Carries the tool calls extracted from the LLM result for the caller to execute.
+    The session extracts _prepared internally to construct the next PreparedChat.
+    Callers must NOT access _prepared directly — the only valid operation is
+    passing this object to session.add_tool_results().
+    """
+
     tool_calls: list[dict[str, Any]]
-    tool_results: list[Any]
-    error: RepublicError | None
+    result: LLMResult
+    _prepared: PreparedChat
 
-    @classmethod
-    def text_result(cls, text: str) -> ToolAutoResult:
-        return cls(
-            kind="text",
-            text=text,
-            tool_calls=[],
-            tool_results=[],
-            error=None,
-        )
 
-    @classmethod
-    def tools_result(
-        cls,
-        tool_calls: list[dict[str, Any]],
-        tool_results: list[Any],
-    ) -> ToolAutoResult:
-        return cls(
-            kind="tools",
-            text=None,
-            tool_calls=tool_calls,
-            tool_results=tool_results,
-            error=None,
-        )
+type TurnResult = Finished | ToolCallNeeded
 
-    @classmethod
-    def error_result(
-        cls,
-        error: RepublicError,
-        *,
-        tool_calls: list[dict[str, Any]] | None = None,
-        tool_results: list[Any] | None = None,
-    ) -> ToolAutoResult:
-        return cls(
-            kind="error",
-            text=None,
-            tool_calls=tool_calls or [],
-            tool_results=tool_results or [],
-            error=error,
-        )
+
+# =============================================================================
+# TOOL SCHEMA HELPER
+# =============================================================================
+
+def get_tool_schemas(tools: Any) -> list[dict[str, Any]]:
+    """Extract JSON schemas from ToolInput for LLM API payload.
+
+    Separates schema extraction from runnable tool execution.
+    ChatClient receives schemas only; the agent loop receives both schemas and runnable tools.
+    """
+    from republic.tools.schema import normalize_tools
+
+    toolset = normalize_tools(tools)
+    return toolset.payload or []

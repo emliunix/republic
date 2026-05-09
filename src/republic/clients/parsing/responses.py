@@ -118,6 +118,22 @@ class ResponseTransportParser(BaseTransportParser):
             calls.append(entry)
         return expand_tool_calls(calls)
 
+    def extract_reasoning(self, response: Any) -> dict | None:
+        output = response if isinstance(response, list) else field(response, "output")
+        if not isinstance(output, list):
+            return None
+        for item in output:
+            if field(item, "type") == "reasoning":
+                if hasattr(item, "__dict__"):
+                    return dict(item.__dict__)
+                elif isinstance(item, dict):
+                    return dict(item)
+                return None
+        return None
+
+    def extract_chunk_reasoning(self, chunk: Any) -> str:
+        return ""
+
     def extract_usage(self, response: Any) -> dict[str, Any] | None:
         event_type = field(response, "type")
         if event_type in {"response.completed", "response.in_progress", "response.failed", "response.incomplete"}:

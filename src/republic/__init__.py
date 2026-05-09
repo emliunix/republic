@@ -10,16 +10,19 @@ from republic.auth import (
 )
 from republic.core.results import (
     AsyncStreamEvents,
-    AsyncTextStream,
+    ErrorEvent,
+    FinalEvent,
+    Finished,
+    LLMResult,
+    PreparedChat,
     RepublicError,
     StreamEvent,
-    StreamEvents,
-    StreamState,
-    TextStream,
-    ToolAutoResult,
+    TextEvent,
+    ToolCallNeeded,
+    TurnResult,
 )
 from republic.llm import LLM
-from republic.tape import AsyncTapeManager, AsyncTapeStore, Tape, TapeContext, TapeEntry, TapeManager, TapeQuery
+from republic.tape import AsyncTapeManager, AsyncTapeStore, TapeContext, TapeEntry, TapeQuery, TapeSession
 from republic.tools import Tool, ToolContext, ToolSet, schema_from_model, tool, tool_from_model
 
 __all__ = [
@@ -27,21 +30,23 @@ __all__ = [
     "AsyncStreamEvents",
     "AsyncTapeManager",
     "AsyncTapeStore",
-    "AsyncTextStream",
+    "ErrorEvent",
+    "FinalEvent",
+    "Finished",
+    "LLMResult",
+    "PreparedChat",
     "RepublicError",
     "StreamEvent",
-    "StreamEvents",
-    "StreamState",
-    "Tape",
     "TapeContext",
     "TapeEntry",
-    "TapeManager",
     "TapeQuery",
-    "TextStream",
+    "TapeSession",
+    "TextEvent",
     "Tool",
-    "ToolAutoResult",
+    "ToolCallNeeded",
     "ToolContext",
     "ToolSet",
+    "TurnResult",
     "github_copilot_oauth_resolver",
     "load_openai_codex_oauth_tokens",
     "login_github_copilot_oauth",
