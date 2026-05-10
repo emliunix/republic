@@ -35,6 +35,7 @@ class PreparedChat:
     reasoning_effort: Any | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
     run_id: str = field(default_factory=lambda: __import__("uuid").uuid4().hex)
+    system_prompt: str | None = None
 
     @property
     def core_kwargs(self) -> dict[str, Any]:

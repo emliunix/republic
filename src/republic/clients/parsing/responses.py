@@ -69,13 +69,13 @@ class ResponseTransportParser(BaseTransportParser):
             return self._tool_delta_from_output_item_event(chunk, event_type)
         return []
 
-    def extract_chunk_text(self, chunk: Any) -> str:
+    def extract_chunk_text(self, chunk: Any) -> tuple[str | None, str | None]:
         if field(chunk, "type") != "response.output_text.delta":
-            return ""
+            return None, None
         delta = field(chunk, "delta")
         if isinstance(delta, str):
-            return delta
-        return ""
+            return delta, None
+        return None, None
 
     def extract_text_from_output(self, output: Any) -> str:
         if not isinstance(output, list):

@@ -12,6 +12,7 @@ from republic.core.results import (
     ToolCallNeeded,
 )
 from republic.tape.entries import TapeEntry
+from republic.tape.manager import AsyncTapeManager
 from republic.tape.session import TapeSession
 from republic.tape.store import InMemoryTapeStore
 
@@ -19,16 +20,15 @@ from .test_chat_client_v2 import FakeLLMCore
 from .fakes import make_response
 
 
-@pytest.fixture
-async def session() -> TapeSession:
-    store = InMemoryTapeStore()
-    return TapeSession("test_tape", store)
+def _make_session(store: InMemoryTapeStore, context: Any = None) -> TapeSession:
+    mgr = AsyncTapeManager(store=store, default_context=context)
+    return TapeSession("test_tape", store, mgr)
 
 
 @pytest.mark.asyncio
 async def test_prepare_records_user_message() -> None:
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store)
+    session = _make_session(store)
 
     prepared = await session.prepare("hello", "openai", "gpt-4", system_prompt="You are helpful")
 
@@ -46,7 +46,7 @@ async def test_prepare_records_user_message() -> None:
 async def test_run_records_assistant_message() -> None:
     from republic.tape.context import TapeContext
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store, context=TapeContext(anchor=None))
+    session = _make_session(store, TapeContext(anchor=None))
 
     core = FakeLLMCore()
     core.responses.append(make_response(text="hi there"))
@@ -72,7 +72,7 @@ async def test_run_records_assistant_message() -> None:
 async def test_run_returns_tool_call_needed() -> None:
     from republic.tape.context import TapeContext
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store, context=TapeContext(anchor=None))
+    session = _make_session(store, TapeContext(anchor=None))
 
     core = FakeLLMCore()
     from tests.fakes import make_tool_call
@@ -98,7 +98,7 @@ async def test_run_returns_tool_call_needed() -> None:
 async def test_add_tool_results_records_tool_result() -> None:
     from republic.tape.context import TapeContext
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store, context=TapeContext(anchor=None))
+    session = _make_session(store, TapeContext(anchor=None))
 
     core = FakeLLMCore()
     from tests.fakes import make_tool_call
@@ -131,7 +131,7 @@ async def test_add_tool_results_records_tool_result() -> None:
 @pytest.mark.asyncio
 async def test_handoff_appends_anchor() -> None:
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store)
+    session = _make_session(store)
 
     await session.handoff("checkpoint_1", state={"step": 1})
 
@@ -144,7 +144,7 @@ async def test_handoff_appends_anchor() -> None:
 @pytest.mark.asyncio
 async def test_append_event_records_framework_event() -> None:
     store = InMemoryTapeStore()
-    session = TapeSession("test_tape", store)
+    session = _make_session(store)
 
     prepared = await session.prepare("hello", "openai", "gpt-4")
     entry = await session.append_event(prepared, "loop.step", {"iteration": 1})

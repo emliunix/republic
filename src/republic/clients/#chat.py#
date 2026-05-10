@@ -354,7 +354,7 @@ def _chat_on_response(
 def _error_iter(error: RepublicError) -> AsyncStreamEvents[LLMResult]:
     async def _error_iter():
         yield ErrorEvent(error)
-    return AsyncStreamEvents(_error_iter())
+def _stream_on_response(    return AsyncStreamEvents(_error_iter())
 
 
 # =============================================================================
@@ -467,12 +467,10 @@ class ChatClient:
                     accumulator.assembler.add_deltas(_extract_chunk_tool_call_deltas(chunk, transport=transport))
 
                     text, reasoning = _extract_chunk_text(chunk, transport=transport)
-                    if text or reasoning:
-                        if text:
-                            accumulator.text_parts.append(text)
-                        if reasoning:
-                            accumulator.reasoning_parts.append(reasoning)
-                        yield TextEvent(content=text or None, reasoning=reasoning)
+                    if text:
+                        accumulator.text_parts.append(text)
+                        accumulator.reasoning_parts.append(reasoning or "")
+                        yield TextEvent(content=text, reasoning=reasoning)
 
                 result = accumulator.to_result(prepared)
                 if not result.text and not result.tool_calls and not result.metadata_only:

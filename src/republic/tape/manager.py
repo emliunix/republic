@@ -15,6 +15,7 @@ from republic.tape.store import (
     AsyncTapeStore,
     InMemoryTapeStore,
 )
+from republic.tape.session import TapeSession
 
 
 class AsyncTapeManager:
@@ -79,8 +80,7 @@ class AsyncTapeManager:
         self, tape_name: str,
         context: TapeContext | None = None,
     ) -> AsyncIterator[TapeSession]:
-        from republic.tape.session import TapeSession
         try:
-            yield TapeSession(tape_name, self._tape_store, context or self.default_context)
+            yield TapeSession(tape_name, self._tape_store, self)
         finally:
             pass

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from republic.tape.context import _prune_all_but_last_assistant, _prune_non_toolcalls
+from republic.tape.context import _prune_all_but_last_assistant, _prune_non_toolcalls, _build_full_messages
+from republic.tape.entries import TapeEntry
 
 
 class TestPruneAllButLastAssistant:
@@ -151,3 +152,39 @@ class TestPruneNonToolcalls:
             {"role": "user", "content": "q"},
             {"role": "assistant", "content": "a"},
         ]
+
+
+class TestBuildFullMessages:
+    """_build_full_messages excludes system entries — they are for logging only."""
+
+    def test_system_entries_excluded(self) -> None:
+        """System tape entries should NOT appear in API messages."""
+        entries = [
+            TapeEntry.system("You are a helpful assistant"),
+            TapeEntry.message({"role": "user", "content": "hello"}),
+        ]
+        messages = _build_full_messages(entries)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "hello"
+
+    def test_old_system_entries_without_role_excluded(self) -> None:
+        """Old system entries lacking 'role' field must not cause API errors."""
+        entries = [
+            TapeEntry(id=0, kind="system", payload={"content": "old system"}),
+            TapeEntry.message({"role": "user", "content": "hi"}),
+        ]
+        messages = _build_full_messages(entries)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+
+    def test_message_entries_included(self) -> None:
+        """Regular message entries are included in API messages."""
+        entries = [
+            TapeEntry.message({"role": "user", "content": "q1"}),
+            TapeEntry.message({"role": "assistant", "content": "a1"}),
+        ]
+        messages = _build_full_messages(entries)
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"

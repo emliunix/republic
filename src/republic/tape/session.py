@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 import contextlib
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 import uuid
 
 from republic.core.errors import ErrorKind, RepublicError
@@ -22,12 +22,21 @@ from republic.core.results import (
 )
 from republic.tape.context import TapeContext
 from republic.tape.entries import TapeEntry
-from republic.tape.manager import AsyncTapeManager
 from republic.tape.store import AsyncTapeStore
 from republic.tools.schema import ToolInput
 
-if TYPE_CHECKING:
-    from republic.clients.chat import ChatClient
+from republic.clients.chat import ChatClient
+from republic.utils import ensure_drained
+
+
+class TapeManagerProto(Protocol):
+    @property
+    def default_context(self) -> TapeContext: ...
+    async def list_tapes(self) -> list[str]: ...
+    async def read_messages(self, tape: str, *, context: TapeContext | None = None) -> list[dict[str, Any]]: ...
+    async def append_entry(self, tape: str, entry: TapeEntry) -> None: ...
+    async def reset_tape(self, tape: str) -> None: ...
+    async def handoff(self, tape: str, name: str, *, state: dict[str, Any] | None = None, **meta: Any) -> list[TapeEntry]: ...
 
 
 class TapeSession:
@@ -49,22 +58,12 @@ class TapeSession:
         self,
         name: str,
         store: AsyncTapeStore,
-        context: TapeContext | None = None,
+        manager: TapeManagerProto,
     ) -> None:
         self._name = name
         self._store = store
-        self._context = context or TapeContext()
-        self._manager = AsyncTapeManager(store=store, default_context=context)
-
-    @contextlib.asynccontextmanager
-    @staticmethod
-    async def create(name: str, store: AsyncTapeStore, context: TapeContext | None = None) -> AsyncIterator[TapeSession]:
-        """Just to denote the session semantics"""
-        session = TapeSession(name, store, context)
-        try:
-            yield session
-        finally:
-            pass
+        self._manager = manager
+        self._context = manager.default_context
 
     @property
     def name(self) -> str:
@@ -83,6 +82,7 @@ class TapeSession:
         system_prompt: str | None = None,
         tools: ToolInput = None,
         max_tokens: int | None = None,
+        reasoning_effort: Any | None = None,
         **kwargs: Any,
     ) -> PreparedChat:
         from republic.core.results import get_tool_schemas
@@ -99,8 +99,10 @@ class TapeSession:
             model=model,
             provider=provider,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             kwargs=kwargs,
             run_id=run_id,
+            system_prompt=system_prompt,
         )
 
     async def run(
@@ -109,6 +111,8 @@ class TapeSession:
         prepared: PreparedChat,
     ) -> TurnResult:
         messages = await self._manager.read_messages(self._name, context=self._context)
+        if prepared.system_prompt:
+            messages = [{"role": "system", "content": prepared.system_prompt}, *messages]
         try:
             result = await chat.chat(prepared, messages)
         except RepublicError as e:
@@ -131,32 +135,33 @@ class TapeSession:
         chat: ChatClient,
         prepared: PreparedChat,
     ) -> AsyncStreamEvents[TurnResult]:
-        messages = await self._manager.read_messages(self._name, context=self._context)
-        stream = await chat.stream(prepared, messages)
-
         async def _wrapper() -> AsyncIterator[StreamEvent[TurnResult]]:
-            iterable = AsyncIteratorWrapper(stream.__aiter__())
-            async for event in iterable:
-                match event:
-                    case TextEvent():
-                        yield event
-                    case FinalEvent(result) if result.tool_calls:
-                        yield FinalEvent(result=ToolCallNeeded(
-                            tool_calls=result.tool_calls,
-                            result=result,
-                            _prepared=prepared))
-                        await self._record_result(prepared, result)
-                        break
-                    case FinalEvent(result):
-                        yield FinalEvent(result=Finished(result=result))
-                        await self._record_result(prepared, result)
-                        break
-                    case ErrorEvent():
-                        yield event
-                        await self._record_result_error(prepared, event.error)
-                        break
-            async for event in iterable:
-                yield ErrorEvent(error=RepublicError(ErrorKind.UNKNOWN, "Received events after stream completion"))
+            messages = await self._manager.read_messages(self._name, context=self._context)
+            if prepared.system_prompt:
+                messages = [{"role": "system", "content": prepared.system_prompt}, *messages]
+            stream = await chat.stream(prepared, messages)
+            async with ensure_drained(stream) as iterable:
+                async for event in iterable:
+                    match event:
+                        case TextEvent():
+                            yield event
+                        case FinalEvent(result) if result.tool_calls:
+                            await self._record_result(prepared, result)
+                            yield FinalEvent(result=ToolCallNeeded(
+                                tool_calls=result.tool_calls,
+                                result=result,
+                                _prepared=prepared))
+                            break
+                        case FinalEvent(result):
+                            await self._record_result(prepared, result)
+                            yield FinalEvent(result=Finished(result=result))
+                            break
+                        case ErrorEvent():
+                            await self._record_result_error(prepared, event.error)
+                            yield event
+                            break
+                async for event in iterable:
+                    yield ErrorEvent(error=RepublicError(ErrorKind.UNKNOWN, "Received events after stream completion"))
 
         return AsyncStreamEvents(_wrapper())
 
@@ -240,14 +245,3 @@ class TapeSession:
 
     async def _append_entry(self, entry: TapeEntry) -> None:
         await self._manager.append_entry(self._name, entry)
-
-
-T = TypeVar("T")
-
-
-class AsyncIteratorWrapper(Generic[T]):
-    def __init__(self, async_iterator: AsyncIterator[T]) -> None:
-        self._async_iterator = async_iterator
-
-    def __aiter__(self) -> AsyncIterator[T]:
-        return self._async_iterator

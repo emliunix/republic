@@ -119,7 +119,7 @@ def _build_full_messages(entries: Iterable[TapeEntry]) -> list[dict[str, Any]]:
                     "tool_call_id": call.get("id"),
                 }
                 messages.append(tool_message)
-                last_tool_calls = None
+            last_tool_calls = None
 
     return messages
 

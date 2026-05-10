@@ -210,6 +210,16 @@ class LLMCore:
             return self._api_base.get(provider)
         return self._api_base
 
+    def _resolve_client_args(self, provider: str) -> dict[str, Any]:
+        args = self._client_args or {}
+        if not args:
+            return {}
+        # Presence of "default" key signals provider-specific mode (consistent with
+        # reasoning_strategy). Without it, the dict is treated as global client_args.
+        if "default" in args:
+            return args.get(provider, args.get("default", {}))
+        return args
+
     def _freeze_cache_key(self, provider: str, api_key: str | None, api_base: str | None) -> str:
         def _freeze(value: Any) -> Any:
             if isinstance(value, (str, int, float, bool)) or value is None:
@@ -224,21 +234,24 @@ class LLMCore:
             "provider": provider,
             "api_key": api_key,
             "api_base": api_base,
-            "client_args": _freeze(self._client_args),
+            "client_args": _freeze(self._resolve_client_args(provider)),
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def get_client(self, provider: str) -> Any:
         api_key = self._resolve_api_key(provider)
         api_base = self._resolve_api_base(provider)
+        client_args = self._resolve_client_args(provider)
+        logger.debug("get_client provider={} client_args={}", provider, client_args)
         cache_key = self._freeze_cache_key(provider, api_key, api_base)
         if cache_key not in self._client_cache:
             client = create_anyllm_client(
                 provider=provider,
                 api_key=api_key,
                 api_base=api_base,
-                client_args=self._client_args,
+                client_args=client_args,
             )
+            logger.debug("get_client created provider={} cache_key={}", provider, cache_key)
             self._client_cache[cache_key] = client
         return self._client_cache[cache_key]
 
@@ -541,6 +554,7 @@ class LLMCore:
             request.stream,
             completion_kwargs,
         )
+        logger.debug("_call_completion_like_async provider={} model={} completion_kwargs={} reasoning_effort={}", request.provider_name, request.model_id, completion_kwargs, request.reasoning_effort)
         return TransportResponse(
             transport=transport,
             payload= await request.client.acompletion(
