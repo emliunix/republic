@@ -36,7 +36,7 @@ class TapeManagerProto(Protocol):
     async def read_messages(self, tape: str, *, context: TapeContext | None = None) -> list[dict[str, Any]]: ...
     async def append_entry(self, tape: str, entry: TapeEntry) -> None: ...
     async def reset_tape(self, tape: str) -> None: ...
-    async def handoff(self, tape: str, name: str, *, state: dict[str, Any] | None = None, **meta: Any) -> list[TapeEntry]: ...
+    async def handoff(self, tape: str, name: str, *, anchor_state: dict[str, Any] | None = None, **meta: Any) -> list[TapeEntry]: ...
 
 
 class TapeSession:
@@ -52,7 +52,6 @@ class TapeSession:
     - append_entry() takes effect immediately
     - stream() is atomic w.r.t tape in that the accumulated entries will writes in batch on success or a error entry on error
     """
-    _run_entry: TapeEntry | None
 
     def __init__(
         self,
@@ -183,10 +182,10 @@ class TapeSession:
         self,
         name: str,
         *,
-        state: dict[str, Any] | None = None,
+        anchor_state: dict[str, Any] | None = None,
         **meta: Any,
     ) -> list[TapeEntry]:
-        return await self._manager.handoff(self._name, name, state=state, **meta)
+        return await self._manager.handoff(self._name, name, anchor_state=anchor_state, **meta)
 
     async def append_event(
         self,

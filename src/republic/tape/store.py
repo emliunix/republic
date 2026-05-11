@@ -146,7 +146,18 @@ class InMemoryQueryMixin:
 
 
 class InMemoryTapeStore(InMemoryQueryMixin, AsyncTapeStore):
-    """In-memory tape storage (not thread-safe)."""
+    """
+    In-memory tape storage (not thread-safe).
+
+    In practice, this is used by AsyncTapeManager to construct a temporary workspace for a LLM chat turn
+    where it's in the sequence of:
+    - user
+    - assistant (w/ tool_calls)
+    - tool (where content is tool_results)
+    - asssitant (w/ tool_calls)
+    - tool
+    - assistnat (w/o tool_calls, stop)
+    """
 
     def __init__(self) -> None:
         self._tapes: dict[str, list[TapeEntry]] = {}
@@ -156,8 +167,8 @@ class InMemoryTapeStore(InMemoryQueryMixin, AsyncTapeStore):
         return sorted(self._tapes.keys())
 
     async def reset(self, tape: str) -> None:
-        self._tapes.pop(tape, None)
-        self._next_id.pop(tape, None)
+        _ = self._tapes.pop(tape, None)
+        _ = self._next_id.pop(tape, None)
 
     def read(self, tape: str) -> list[TapeEntry] | None:
         entries = self._tapes.get(tape)

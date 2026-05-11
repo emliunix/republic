@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 import contextlib
 import inspect
 from typing import Any, cast
@@ -66,11 +66,11 @@ class AsyncTapeManager:
         tape: str,
         name: str,
         *,
-        state: dict[str, Any] | None = None,
+        anchor_state: dict[str, Any] | None = None,
         **meta: Any,
     ) -> list[TapeEntry]:
-        entry = TapeEntry.anchor(name, state=state, **meta)
-        event = TapeEntry.event("handoff", {"name": name, "state": state or {}}, **meta)
+        entry = TapeEntry.anchor(name, state=anchor_state, **meta)
+        event = TapeEntry.event("handoff", {"name": name, "state": anchor_state or {}}, **meta)
         await self._tape_store.append(tape, entry)
         await self._tape_store.append(tape, event)
         return [entry, event]
@@ -79,7 +79,7 @@ class AsyncTapeManager:
     async def session(
         self, tape_name: str,
         context: TapeContext | None = None,
-    ) -> AsyncIterator[TapeSession]:
+    ) -> AsyncGenerator[TapeSession, None]:
         try:
             yield TapeSession(tape_name, self._tape_store, self)
         finally:

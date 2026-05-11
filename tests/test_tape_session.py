@@ -133,7 +133,7 @@ async def test_handoff_appends_anchor() -> None:
     store = InMemoryTapeStore()
     session = _make_session(store)
 
-    await session.handoff("checkpoint_1", state={"step": 1})
+    await session.handoff("checkpoint_1", anchor_state={"step": 1})
 
     entries = store.read("test_tape") or []
     assert len(entries) == 2  # anchor + handoff event
