@@ -41,12 +41,10 @@ class TapeContext:
 
     anchor: LAST_ANCHOR for the most recent anchor, None for the full tape, or an anchor name.
     select: Optional selector called after anchor slicing that returns messages.
-    state: Optional state dictionary to be passed along with the context.
     """
 
     anchor: AnchorSelector = LAST_ANCHOR
     select: ContextSelector | None = None
-    state: dict[str, Any] = field(default_factory=dict)
     reasoning_strategy: ReasoningStrategy = ReasoningStrategy.PRUNE
 
     def build_query(self, query: TapeQuery) -> TapeQuery:

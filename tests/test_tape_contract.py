@@ -66,19 +66,18 @@ async def test_async_manager_awaits_context_selector_after_anchor_slice() -> Non
 
     seen: dict[str, object] = {}
 
+    prefix = "summary"
     async def select(entries, context):
         entry_list = list(entries)
         seen["contents"] = [entry.payload["content"] for entry in entry_list]
-        seen["state"] = dict(context.state)
-        return [{"role": "system", "content": f"{context.state['prefix']}:{entry_list[0].payload['content']}"}]
+        return [{"role": "system", "content": f"{prefix}:{entry_list[0].payload['content']}"}]
 
-    context = TapeContext(anchor=LAST_ANCHOR, select=select, state={"prefix": "summary"})
+    context = TapeContext(anchor=LAST_ANCHOR, select=select)
     messages = await manager.read_messages("test_tape", context=context)
 
     assert messages == [{"role": "system", "content": "summary:task 2"}]
     assert seen == {
         "contents": ["task 2"],
-        "state": {"prefix": "summary"},
     }
 
 
