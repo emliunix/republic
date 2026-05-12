@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from republic.clients.chat import ChatClient
@@ -21,8 +23,10 @@ from .fakes import make_response
 
 
 def _make_session(store: InMemoryTapeStore, context: Any = None) -> TapeSession:
-    mgr = AsyncTapeManager(store=store, default_context=context)
-    return TapeSession("test_tape", store, mgr)
+    from republic.tape.context import TapeContext
+    if context is None:
+        context = TapeContext()
+    return TapeSession("test_tape", store, context)
 
 
 @pytest.mark.asyncio
@@ -87,11 +91,8 @@ async def test_run_returns_tool_call_needed() -> None:
     assert result.tool_calls[0]["function"]["name"] == "echo"
 
     entries = store.read("test_tape") or []
-    # user + assistant(with tool_calls) + tool_call(dual save) + run event
-    assert len(entries) == 4
-    assert entries[1].kind == "message"
-    assert entries[1].payload.get("tool_calls") is not None
-    assert entries[2].kind == "tool_call"
+    # With deferred recording, only prepare() entries are written until add_tool_results
+    assert len(entries) == 1  # user message from prepare()
 
 
 @pytest.mark.asyncio
@@ -119,6 +120,8 @@ async def test_add_tool_results_records_tool_result() -> None:
     assert isinstance(next_prepared, PreparedChat)
 
     entries = store.read("test_tape") or []
+    # Now all entries are recorded: user + assistant + tool_call + tool_result + run event
+    assert len(entries) == 5
     tool_result_entries = [e for e in entries if e.kind == "tool_result"]
     assert len(tool_result_entries) == 1
 
@@ -133,7 +136,8 @@ async def test_handoff_appends_anchor() -> None:
     store = InMemoryTapeStore()
     session = _make_session(store)
 
-    await session.handoff("checkpoint_1", anchor_state={"step": 1})
+    async with session:
+        session.handoff("checkpoint_1", anchor_state={"step": 1})
 
     entries = store.read("test_tape") or []
     assert len(entries) == 2  # anchor + handoff event
@@ -147,7 +151,7 @@ async def test_append_event_records_framework_event() -> None:
     session = _make_session(store)
 
     prepared = await session.prepare("hello", "openai", "gpt-4")
-    entry = await session.append_event(prepared, "loop.step", {"iteration": 1})
+    entry = await session.append_event("loop.step", {"iteration": 1})
 
     assert entry.kind == "event"
     assert entry.payload["name"] == "loop.step"
