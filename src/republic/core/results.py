@@ -47,6 +47,12 @@ class PreparedChat:
             "reasoning_effort": self.reasoning_effort,
             "kwargs": self.kwargs,
         }
+    
+    @property
+    def metas(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,10 @@ class Finished:
 
     result: LLMResult
 
+    @property
+    def metas(self) -> dict[str, Any]:
+        return self.result.request.metas
+
 
 @dataclass(frozen=True)
 class ToolCallNeeded:
@@ -123,7 +133,10 @@ class ToolCallNeeded:
 
     tool_calls: list[dict[str, Any]]
     result: LLMResult
-    _prepared: PreparedChat
+
+    @property
+    def metas(self) -> dict[str, Any]:
+        return self.result.request.metas
 
 
 type TurnResult = Finished | ToolCallNeeded

@@ -29,6 +29,8 @@ class AsyncTapeStore(Protocol):
 
     async def append(self, tape: str, entry: TapeEntry) -> None: ...
 
+    async def fork_tape(self, source_name: str, target_name: str) -> None: ...
+
 
 def is_async_tape_store(store: AsyncTapeStore) -> TypeGuard[AsyncTapeStore]:
     return hasattr(store, "append") and inspect.iscoroutinefunction(store.append)
@@ -143,6 +145,9 @@ class InMemoryQueryMixin:
         if query._limit is not None:
             sliced = sliced[: query._limit]
         return sliced
+    
+    async def fork_tape(self, source_name: str, target_name: str) -> None:
+        raise NotImplementedError("InMemoryQueryMixin does not implement fork(). Please implement in subclass if needed.")
 
 
 class InMemoryTapeStore(InMemoryQueryMixin, AsyncTapeStore):

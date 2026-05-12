@@ -22,21 +22,12 @@ from republic.core.results import (
 )
 from republic.tape.context import TapeContext
 from republic.tape.entries import TapeEntry
+from republic.tape.manager import AsyncTapeManager
 from republic.tape.store import AsyncTapeStore
 from republic.tools.schema import ToolInput
 
 from republic.clients.chat import ChatClient
 from republic.utils import ensure_drained
-
-
-class TapeManagerProto(Protocol):
-    @property
-    def default_context(self) -> TapeContext: ...
-    async def list_tapes(self) -> list[str]: ...
-    async def read_messages(self, tape: str, *, context: TapeContext | None = None) -> list[dict[str, Any]]: ...
-    async def append_entry(self, tape: str, entry: TapeEntry) -> None: ...
-    async def reset_tape(self, tape: str) -> None: ...
-    async def handoff(self, tape: str, name: str, *, anchor_state: dict[str, Any] | None = None, **meta: Any) -> list[TapeEntry]: ...
 
 
 class TapeSession:
@@ -52,17 +43,19 @@ class TapeSession:
     - append_entry() takes effect immediately
     - stream() is atomic w.r.t tape in that the accumulated entries will writes in batch on success or a error entry on error
     """
+    _deferred_entries: list[TapeEntry]
 
     def __init__(
         self,
         name: str,
         store: AsyncTapeStore,
-        manager: TapeManagerProto,
+        context: TapeContext,
     ) -> None:
         self._name = name
         self._store = store
-        self._manager = manager
-        self._context = manager.default_context
+        self._manager = AsyncTapeManager(store=store)
+        self._context = context
+        self._deferred_entries = []
 
     @property
     def name(self) -> str:
@@ -118,15 +111,13 @@ class TapeSession:
             await self._record_result_error(prepared, e)
             raise
 
-        await self._record_result(prepared, result)
-
         if result.tool_calls:
             return ToolCallNeeded(
                 tool_calls=result.tool_calls,
                 result=result,
-                _prepared=prepared,
             )
 
+        await self._record_result(result)
         return Finished(result=result)
 
     async def stream(
@@ -145,14 +136,14 @@ class TapeSession:
                         case TextEvent():
                             yield event
                         case FinalEvent(result) if result.tool_calls:
-                            await self._record_result(prepared, result)
+                            # NOTE: no _record_result, defer to add_tool_results
                             yield FinalEvent(result=ToolCallNeeded(
                                 tool_calls=result.tool_calls,
                                 result=result,
-                                _prepared=prepared))
+                            ))
                             break
                         case FinalEvent(result):
-                            await self._record_result(prepared, result)
+                            await self._record_result(result)
                             yield FinalEvent(result=Finished(result=result))
                             break
                         case ErrorEvent():
@@ -169,41 +160,63 @@ class TapeSession:
         needed: ToolCallNeeded,
         results: list[Any],
     ) -> PreparedChat:
-        meta = {"run_id": needed._prepared.run_id}
         if len(results) != len(needed.tool_calls):
             raise RepublicError(
                 ErrorKind.INVALID_INPUT,
                 f"Expected {len(needed.tool_calls)} tool results, got {len(results)}"
             )
-        await self._append_entry(TapeEntry.tool_result(results, **meta))
-        return needed._prepared
+        await self._record_result(needed.result, tool_result=results)
+        return needed.result.request
+    
+    async def add_tool_error(
+        self,
+        needed: ToolCallNeeded,
+        error: Exception,
+    ) -> None:
+        await self._record_result_error(needed.result.request, error)
 
-    async def handoff(
+    def handoff(
         self,
         name: str,
         *,
         anchor_state: dict[str, Any] | None = None,
         **meta: Any,
     ) -> list[TapeEntry]:
-        return await self._manager.handoff(self._name, name, anchor_state=anchor_state, **meta)
-
+        entries =self._manager.handoff(self._name, name, anchor_state=anchor_state, **meta)
+        self._deferred_entries.extend(entries)
+        return entries
+    
+    def append_entry(self, entry: TapeEntry) -> None:
+        self._deferred_entries.append(entry)
+    
     async def append_event(
         self,
-        prepared: PreparedChat,
         name: str,
         data: dict[str, Any] | None = None,
+        **meta: Any,
     ) -> TapeEntry:
-        meta = {"run_id": prepared.run_id}
-        entry = TapeEntry.event(name, data, **meta)
-        await self._manager.append_entry(self._name, entry)
+        """
+        Contrary to append_entry, append_event is immediate. 
+        The rationale is events are like logs, and we don't need to take care of integrity
+        """
+        entry = TapeEntry.event(name=name, data=data, **meta)
+        await self._append_entry(entry)
         return entry
 
     async def _record_result(
         self,
-        prepared: PreparedChat,
         result: LLMResult,
+        tool_result: list[Any] | None = None,
     ) -> None:
-        meta = {"run_id": prepared.run_id}
+        """
+        Record a complete LLM call:
+        - assistant with tool_calls
+        - commentary tool_call entry
+        - tool_result entries if any
+
+        The invariant is if assistant entry has tool_calls, the tool_calls and tool_result are saved together
+        """
+        meta = {"run_id": result.request.run_id}
 
         assistant_payload: dict[str, Any] = {"role": "assistant"}
         if result.text:
@@ -213,16 +226,23 @@ class TapeSession:
         if result.tool_calls:
             assistant_payload["tool_calls"] = result.tool_calls
 
+        if result.tool_calls:
+            # check it early so that we don't record partial results
+            if tool_result is None:
+                raise ValueError("tool_result must be provided when result has tool_calls")
+
         await self._append_entry(TapeEntry.message(assistant_payload, **meta))
 
         if result.tool_calls:
             await self._append_entry(TapeEntry.tool_call(result.tool_calls, **meta))
-
+        if tool_result is not None:
+            await self._append_entry(TapeEntry.tool_result(tool_result, **meta))
+        
         data: dict[str, Any] = { "status": "ok" }
         if result.usage:
             data["usage"] = result.usage
-        data["provider"] = prepared.provider
-        data["model"] = prepared.model
+        data["provider"] = result.request.provider
+        data["model"] = result.request.model
 
         await self._append_entry(TapeEntry.event("run", data, **meta))
 
@@ -244,3 +264,12 @@ class TapeSession:
 
     async def _append_entry(self, entry: TapeEntry) -> None:
         await self._manager.append_entry(self._name, entry)
+
+    async def __aenter__(self) -> TapeSession:
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if not exc_val:
+            for entry in self._deferred_entries:
+                await self._append_entry(entry)
+            self._deferred_entries.clear()
