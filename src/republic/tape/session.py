@@ -1,11 +1,32 @@
-"""Tape session view helpers for Republic."""
+"""
+Tape session view helpers for Republic.
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle : create session
+    idle --> prepared : prepare()
+
+    prepared --> finish : run() / stream()<br/>success, no tool_calls
+    prepared --> toolcallneeded : run() / stream()<br/>success, with tool_calls
+    prepared --> error : run() / stream()<br/>exception / ErrorEvent
+
+    toolcallneeded --> prepared : add_tool_results()
+    toolcallneeded --> error : add_tool_error()
+
+    finish --> idle : turn complete
+    error --> idle : error handled
+
+    idle --> [*] : session close
+```
+"""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-import contextlib
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 import uuid
+import contextlib
+
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from republic.core.errors import ErrorKind, RepublicError
 from republic.core.results import (
@@ -15,6 +36,7 @@ from republic.core.results import (
     Finished,
     LLMResult,
     PreparedChat,
+    Prompt,
     StreamEvent,
     TextEvent,
     ToolCallNeeded,
@@ -43,6 +65,7 @@ class TapeSession:
     - append_entry() takes effect immediately
     - stream() is atomic w.r.t tape in that the accumulated entries will writes in batch on success or a error entry on error
     """
+    _system_prompt: str | None
     _deferred_entries: list[TapeEntry]
 
     def __init__(
@@ -55,6 +78,7 @@ class TapeSession:
         self._store = store
         self._manager = AsyncTapeManager(store=store)
         self._context = context
+        self._system_prompt = None
         self._deferred_entries = []
 
     @property
@@ -67,7 +91,6 @@ class TapeSession:
 
     async def prepare(
         self,
-        prompt: str,
         provider: str,
         model: str,
         *,
@@ -80,28 +103,34 @@ class TapeSession:
         from republic.core.results import get_tool_schemas
 
         run_id = uuid.uuid4().hex
-        meta = {"run_id": run_id}
+        metas = {"run_id": run_id}
 
         if system_prompt:
-            await self._append_entry(TapeEntry.system(system_prompt, **meta))
-        await self._append_entry(TapeEntry.message({"role": "user", "content": prompt}, **meta))
+            await self._append_entry(TapeEntry.system(system_prompt, **metas))
 
         return PreparedChat(
             tools=get_tool_schemas(tools),
             model=model,
             provider=provider,
+            entries=[],
+            system_prompt=system_prompt,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             kwargs=kwargs,
             run_id=run_id,
-            system_prompt=system_prompt,
         )
+
+    async def _apply_prepared(self, prepared: PreparedChat):
+        for entry in prepared.entries:
+            await self._append_entry(entry)
+        prepared.entries.clear()
 
     async def run(
         self,
         chat: ChatClient,
         prepared: PreparedChat,
     ) -> TurnResult:
+        await self._apply_prepared(prepared)
         messages = await self._manager.read_messages(self._name, context=self._context)
         if prepared.system_prompt:
             messages = [{"role": "system", "content": prepared.system_prompt}, *messages]
@@ -126,6 +155,7 @@ class TapeSession:
         prepared: PreparedChat,
     ) -> AsyncStreamEvents[TurnResult]:
         async def _wrapper() -> AsyncIterator[StreamEvent[TurnResult]]:
+            await self._apply_prepared(prepared)
             messages = await self._manager.read_messages(self._name, context=self._context)
             if prepared.system_prompt:
                 messages = [{"role": "system", "content": prepared.system_prompt}, *messages]
@@ -166,8 +196,11 @@ class TapeSession:
                 f"Expected {len(needed.tool_calls)} tool results, got {len(results)}"
             )
         await self._record_result(needed.result, tool_result=results)
-        return needed.result.request
-    
+        request = needed.result.request
+        request.entries.extend(self._deferred_entries)
+        self._deferred_entries.clear()
+        return request
+
     async def add_tool_error(
         self,
         needed: ToolCallNeeded,
@@ -175,17 +208,6 @@ class TapeSession:
     ) -> None:
         await self._record_result_error(needed.result.request, error)
 
-    def handoff(
-        self,
-        name: str,
-        *,
-        anchor_state: dict[str, Any] | None = None,
-        **meta: Any,
-    ) -> list[TapeEntry]:
-        entries =self._manager.handoff(self._name, name, anchor_state=anchor_state, **meta)
-        self._deferred_entries.extend(entries)
-        return entries
-    
     def append_entry(self, entry: TapeEntry) -> None:
         self._deferred_entries.append(entry)
     
@@ -237,7 +259,7 @@ class TapeSession:
             await self._append_entry(TapeEntry.tool_call(result.tool_calls, **meta))
         if tool_result is not None:
             await self._append_entry(TapeEntry.tool_result(tool_result, **meta))
-        
+
         data: dict[str, Any] = { "status": "ok" }
         if result.usage:
             data["usage"] = result.usage
@@ -273,3 +295,17 @@ class TapeSession:
             for entry in self._deferred_entries:
                 await self._append_entry(entry)
             self._deferred_entries.clear()
+
+
+def _ensure_text_prompts(prompt: Prompt) -> str:
+    match prompt:
+        case str():
+            return prompt
+        case [dict() as pt] if pt.get("type") == "text":
+            return pt.get("content", "")
+        case _:
+            raise RepublicError(ErrorKind.INVALID_INPUT, f"Unsupported prompt: {prompt}. Expected str.")
+
+
+def prompt_entry(prompt: Prompt, **metas: Any) -> TapeEntry:
+    return TapeEntry.message({"role": "user", "content": _ensure_text_prompts(prompt)}, **metas)

@@ -24,6 +24,7 @@ SelectedMessages: TypeAlias = list[dict[str, Any]] | Coroutine[Any, Any, list[di
 ContextSelector: TypeAlias = Callable[[Iterable[TapeEntry], "TapeContext"], SelectedMessages]
 
 
+# TODO: rename to ReasoningContentStrategy to disambiguate with reasoning effort
 class ReasoningStrategy(StrEnum):
     # preserves all reasoning content in assistant messages
     FULL = "full"

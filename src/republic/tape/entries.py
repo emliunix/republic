@@ -40,6 +40,10 @@ class TapeEntry:
         if state is not None:
             payload["state"] = dict(state)
         return cls(id=0, kind="anchor", payload=payload, meta=dict(meta))
+    
+    @classmethod
+    def handoff(cls, name: str, anchor_state: dict[str, Any] | None = None, **meta: Any) -> TapeEntry:
+        return cls.anchor(name=name, state=anchor_state, **meta)
 
     @classmethod
     def tool_call(cls, calls: list[dict[str, Any]], **meta: Any) -> TapeEntry:

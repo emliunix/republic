@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
 
 from republic.core.errors import RepublicError
 
+if TYPE_CHECKING:
+    from republic.tape.entries import TapeEntry
+
 T = TypeVar("T")
+
+type Prompt = str | list[dict[str, Any]]
 
 
 @dataclass
@@ -30,12 +35,14 @@ class PreparedChat:
 
     model: str
     provider: str
+    # this is a generic buffer that will be inserted to tape before calling LLM. eg. user messages, tool generated entries
+    entries: list["TapeEntry"]
+    run_id: str
+    system_prompt: str | None = None
     tools: list[dict[str, Any]] = field(default_factory=list)
     max_tokens: int | None = None
     reasoning_effort: Any | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
-    run_id: str = field(default_factory=lambda: __import__("uuid").uuid4().hex)
-    system_prompt: str | None = None
 
     @property
     def core_kwargs(self) -> dict[str, Any]:
@@ -104,6 +111,22 @@ class AsyncStreamEvents(Generic[T]):
 
     def __aiter__(self) -> AsyncIterator[StreamEvent[T]]:
         return self._iterator
+    
+    @staticmethod
+    def from_iter(iterable: Iterable[StreamEvent[T]]) -> AsyncStreamEvents[T]:
+        async def gen() -> AsyncIterator[StreamEvent[T]]:
+            for item in iterable:
+                yield item
+        return AsyncStreamEvents(gen())
+    
+    def with_close(self, close_fn: Callable[[], Coroutine[Any, Any, None]]) -> AsyncStreamEvents[T]:
+        async def gen() -> AsyncGenerator[StreamEvent[T], None]:
+            try:
+                async for e in self:
+                    yield e
+            finally:
+                await close_fn()
+        return AsyncStreamEvents(gen())
 
 
 # =============================================================================

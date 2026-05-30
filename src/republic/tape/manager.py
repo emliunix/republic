@@ -40,16 +40,3 @@ class AsyncTapeManager:
 
     async def reset_tape(self, tape: str) -> None:
         await self._tape_store.reset(tape)
-
-    @staticmethod
-    def handoff(
-        tape: str,
-        name: str,
-        *,
-        anchor_state: dict[str, Any] | None = None,
-        **meta: Any,
-    ) -> list[TapeEntry]:
-        entry = TapeEntry.anchor(name, state=anchor_state, **meta)
-        event = TapeEntry.event("handoff", {"name": name, "state": anchor_state or {}}, **meta)
-        return [entry, event]
-    
